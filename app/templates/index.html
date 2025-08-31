@@ -1,0 +1,155 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Telegram Report Builder</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px;max-width:900px}
+    .card{border:1px solid #ddd;border-radius:12px;padding:18px;margin-bottom:16px;box-shadow:0 1px 4px rgba(0,0,0,.05)}
+    .row{display:flex;gap:16px;flex-wrap:wrap}
+    .col{flex:1 1 280px}
+    .btn{background:#0d6efd;color:white;border:none;border-radius:8px;padding:10px 14px;cursor:pointer}
+    .btn:disabled{opacity:.5;cursor:not-allowed}
+    .progress{height:16px;background:#eee;border-radius:8px;overflow:hidden}
+    .bar{height:100%;background:#0d6efd;width:0%}
+    label{display:block;margin-bottom:6px;font-weight:600}
+    select,input{width:100%;padding:8px;border:1px solid #ccc;border-radius:8px}
+    small{color:#666}
+    code{background:#f6f6f6;padding:2px 6px;border-radius:6px}
+  </style>
+</head>
+<body>
+  <h2>Telegram Report Builder</h2>
+  <div class="card">
+    <form id="form">
+      <div class="row">
+        <div class="col">
+          <label>Month</label>
+          <select name="month" id="month">
+            {% for m, sites in months_sites.items() %}
+            <option value="{{m}}">{{m}}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="col">
+          <label>Site</label>
+          <select name="site" id="site"></select>
+          <small id="siteHelp"></small>
+        </div>
+        <div class="col">
+          <label>Task</label>
+          <select name="task" id="task">
+            <option value="grass_cutting">Grass Cutting</option>
+            <option value="drainage_cleaning">Drainage Cleaning</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="row" style="margin-top:12px">
+        <div class="col">
+          <label>Company</label>
+          <input name="company" value="HW UNGGUL (901587-V)">
+        </div>
+        <div class="col">
+          <label>Zone</label>
+          <input name="zone" id="zone" value="ZONE">
+        </div>
+        <div class="col">
+          <label>Section title</label>
+          <input name="title" id="title" value="1. Grass Cutting">
+        </div>
+        <div class="col">
+          <label>Match threshold</label>
+          <input name="threshold" type="number" step="0.01" min="0.5" max="0.95" value="0.70">
+        </div>
+      </div>
+
+      <div class="row" style="margin-top:16px">
+        <button class="btn" id="runBtn" type="submit">Run Report</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="card" id="statusCard" style="display:none">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <div><strong>Status:</strong> <span id="state">-</span></div>
+      <div><a id="downloadLink" href="#" style="display:none" class="btn">Download DOCX</a></div>
+    </div>
+    <div class="progress"><div class="bar" id="bar"></div></div>
+    <div style="margin-top:8px" id="stats"></div>
+  </div>
+
+<script>
+const monthsSites = {{ months_sites|tojson }};
+const monthSel = document.getElementById('month');
+const siteSel = document.getElementById('site');
+const zoneInp = document.getElementById('zone');
+const taskSel = document.getElementById('task');
+const titleInp = document.getElementById('title');
+
+function refreshSites(){
+  const m = monthSel.value;
+  const sites = monthsSites[m] || [];
+  siteSel.innerHTML = sites.map(s => `<option value="${s}">${s}</option>`).join('');
+  zoneInp.value = (siteSel.value || 'SITE') + " ZONE";
+}
+monthSel.addEventListener('change', refreshSites);
+taskSel.addEventListener('change', ()=>{
+  titleInp.value = taskSel.value === 'grass_cutting' ? '1. Grass Cutting' : '2. Drainage Cleaning';
+});
+refreshSites();
+
+const form = document.getElementById('form');
+const statusCard = document.getElementById('statusCard');
+const stateSpan = document.getElementById('state');
+const bar = document.getElementById('bar');
+const stats = document.getElementById('stats');
+const runBtn = document.getElementById('runBtn');
+const downloadLink = document.getElementById('downloadLink');
+
+form.addEventListener('submit', async (e)=>{
+  e.preventDefault();
+  runBtn.disabled = true;
+  stateSpan.textContent = 'starting...';
+  statusCard.style.display = '';
+  bar.style.width = '0%';
+  stats.textContent = '';
+  downloadLink.style.display = 'none';
+  downloadLink.removeAttribute('href');
+
+  const formData = new FormData(form);
+  const r = await fetch('/start', {method:'POST', body: formData});
+  const j = await r.json();
+  if(!j.ok){ alert(j.error || 'Failed'); runBtn.disabled = false; return; }
+  const job = j.job_id;
+
+  const es = new EventSource(`/progress/${job}`);
+  es.onmessage = (ev)=>{
+    const d = JSON.parse(ev.data);
+    stateSpan.textContent = d.state || '-';
+    const total = d.total || d.before || 0;
+    const done = d.done || 0;
+    const pct = total>0 ? Math.round(100*done/total) : (d.state==='done'?100:0);
+    bar.style.width = pct + '%';
+
+    stats.innerHTML = `
+      <div>Before: <code>${d.before||0}</code> · After: <code>${d.after||0}</code> · Matched: <code>${d.matched||0}</code> · Fallback: <code>${d.unmatched||0}</code> · Pages: <code>${d.pages||1}</code></div>
+    `;
+
+    if(d.state === 'done' && d.download){
+      downloadLink.href = '/download?path=' + encodeURIComponent(d.download);
+      downloadLink.style.display = '';
+      es.close();
+      runBtn.disabled = false;
+    }
+    if(d.state === 'error'){
+      alert('Error: ' + (d.error||''));
+      es.close();
+      runBtn.disabled = false;
+    }
+  };
+});
+</script>
+</body>
+</html>

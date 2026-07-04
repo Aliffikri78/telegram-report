@@ -1,0 +1,24 @@
+services:
+  telegram-report-allinone:
+    build: .
+    container_name: telegram-report-allinone
+    environment:
+      - TZ=Asia/Kuala_Lumpur
+      - TG_BOT_TOKEN=${TG_BOT_TOKEN}
+      - TG_CHAT_ID=${TG_CHAT_ID}
+      - SAVE_ROOT=/data/photos
+      - REPORTS_ROOT=/data/reports
+      - COMPANY=HW UNGGUL (901587-V)
+      - THRESHOLD=0.30
+      - VISUAL_WEIGHT=0.80
+      - IMG_H_CM=4.3
+      - IGNORE_NAMES=true
+      - USE_RESNET=true
+      - OMP_NUM_THREADS=2
+    volumes:
+      - /mnt/user/NAS/telegram_report/data/photos:/data/photos
+      - /mnt/user/NAS/telegram_report/data/reports:/data/reports      
+      - /mnt/user/NAS/telegram_report/.torch_cache:/root/.cache/torch
+    ports:
+      - "8080:8080"
+    gpus: all

@@ -1,0 +1,20 @@
+version: "3.9"
+services:
+  telegram_report:
+    build: .
+    container_name: telegram-report
+    environment:
+      TG_BOT_TOKEN: "PUT-YOUR-REAL-TOKEN-HERE"
+      SAVE_ROOT: "/data/photos"
+      TIME_BEFORE_HOUR: "12"
+      TIME_AFTER_HOUR: "15"
+      TZ: "Asia/Kuala_Lumpur"
+      FAST_MAX_SIDE: "1600"
+      FAST_NFEATURES: "600"
+      FAST_TOPK: "5"
+      FAST_RATIO: "0.75"
+    volumes:
+      - ./data:/data
+    ports:
+      - "8080:8080"
+    restart: unless-stopped

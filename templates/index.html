@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Telegram Report – Web UI</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
+</head>
+<body class="bg-gray-50 text-gray-900">
+  <div class="max-w-5xl mx-auto p-6" x-data="app()" x-init="init()">
+    <header class="mb-6">
+      <h1 class="text-3xl font-semibold">Telegram Report – Web UI</h1>
+      <div class="mt-2 text-xs" :class="health.cuda ? 'text-green-700' : 'text-amber-700'">
+        CUDA: <span x-text="health.cuda ? 'Available' : 'Not detected'"></span>
+      </div>
+    </header>
+
+    <div class="grid md:grid-cols-3 gap-6">
+      <div class="md:col-span-2 space-y-4">
+        <div class="bg-white shadow rounded-2xl p-4">
+          <h2 class="text-lg font-medium mb-3">1) Source</h2>
+          <div class="grid sm:grid-cols-2 gap-3">
+            <label class="block"><span class="text-sm">Month</span>
+              <select class="mt-1 w-full border rounded-lg p-2" x-model="form.month" @change="selectSites()">
+                <option value="" disabled>Select month</option>
+                <template x-for="m in months" :key="m"><option :value="m" x-text="m"></option></template>
+              </select>
+            </label>
+            <label class="block"><span class="text-sm">Site</span>
+              <select class="mt-1 w-full border rounded-lg p-2" x-model="form.site">
+                <option value="" disabled>Select site</option>
+                <template x-for="s in sites" :key="s"><option :value="s" x-text="s"></option></template>
+              </select>
+            </label>
+          </div>
+        </div>
+
+        <div class="bg-white shadow rounded-2xl p-4">
+          <h2 class="text-lg font-medium mb-3">2) Task & Layout</h2>
+          <div class="grid sm:grid-cols-3 gap-3">
+            <label class="block"><span class="text-sm">Task</span>
+              <select class="mt-1 w-full border rounded-lg p-2" x-model="form.task">
+                <option value="grass_cutting">Grass Cutting</option>
+                <option value="drainage_cleaning">Drainage Cleaning</option>
+              </select>
+            </label>
+            <label class="block"><span class="text-sm">Company</span>
+              <input class="mt-1 w-full border rounded-lg p-2" x-model="form.company" placeholder="HW UNGGUL (901587-V)"/>
+            </label>
+            <label class="block"><span class="text-sm">Image height (cm)</span>
+              <input type="number" step="0.5" min="3" class="mt-1 w-full border rounded-lg p-2" x-model.number="form.image_height_cm"/>
+            </label>
+          </div>
+          <div class="grid sm:grid-cols-3 gap-3 mt-3">
+            <label class="block"><span class="text-sm">Label language</span>
+              <select class="mt-1 w-full border rounded-lg p-2" x-model="form.label_lang">
+                <option value="ms">Malay (Sebelum/Selepas)</option>
+                <option value="en">English (Before/After)</option>
+              </select>
+            </label>
+            <label class="block"><span class="text-sm">Threshold</span>
+              <input type="number" step="0.01" min="0" max="1" class="mt-1 w-full border rounded-lg p-2" x-model.number="form.threshold"/>
+            </label>
+            <label class="block"><span class="text-sm">Visual weight</span>
+              <input type="number" step="0.01" min="0" max="1" class="mt-1 w-full border rounded-lg p-2" x-model.number="form.visual_weight"/>
+            </label>
+          </div>
+        </div>
+
+        <div class="bg-white shadow rounded-2xl p-4">
+          <h2 class="text-lg font-medium mb-3">3) Paths</h2>
+          <div class="grid sm:grid-cols-2 gap-3">
+            <label class="block"><span class="text-sm">Photos root</span>
+              <input class="mt-1 w-full border rounded-lg p-2" x-model="form.photos_root"/>
+            </label>
+            <label class="block"><span class="text-sm">Reports root</span>
+              <input class="mt-1 w-full border rounded-lg p-2" x-model="form.reports_root"/>
+            </label>
+          </div>
+        </div>
+      </div>
+
+      <div class="space-y-4">
+        <div class="bg-white shadow rounded-2xl p-4">
+          <h2 class="text-lg font-medium mb-3">Actions</h2>
+          <button class="w-full py-2 rounded-xl bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
+                  :disabled="running || !canStart()" @click="startRun()">Generate Report</button>
+          <button class="w-full mt-2 py-2 rounded-xl bg-gray-700 text-white" @click="saveDefault()">Set as Default</button>
+          <button class="w-full mt-2 py-2 rounded-xl bg-gray-500 text-white" @click="loadDefaults()">Reset to Defaults</button>
+          <p class="text-sm text-gray-600 mt-2" x-text="status.msg"></p>
+          <template x-if="status.last_report">
+            <a :href="'/download'" class="inline-block mt-3 text-blue-700 underline">Download latest report</a>
+          </template>
+        </div>
+        <div class="bg-white shadow rounded-2xl p-4">
+          <h2 class="text-lg font-medium mb-3">Status</h2>
+          <div class="flex items-center gap-2">
+            <span class="w-3 h-3 rounded-full" :class="running ? 'bg-amber-500' : 'bg-green-600'"></span>
+            <span class="text-sm" x-text="running ? 'Running…' : 'Idle'"></span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+function app(){
+  return {
+    months: [], sites: [], sitesByMonth: {},
+    health: {cuda:false}, running:false, status:{msg:'', last_report:null},
+    form: {month:'', site:'', task:'grass_cutting', company:'HW UNGGUL (901587-V)',
+           image_height_cm:5.0, label_lang:'ms', threshold:0.95, visual_weight:0.5,
+           photos_root:'/data/photos', reports_root:'/data/reports'},
+    async init(){ await this.fetchHealth(); await this.loadDefaults(); await this.fetchList(); setInterval(()=>this.fetchStatus(),1500); },
+    canStart(){ return this.form.month && this.form.site; },
+    async fetchHealth(){ try{ const r=await fetch('/health'); this.health=await r.json(); }catch(e){} },
+    async fetchList(){ const r=await fetch('/api/list'); const d=await r.json(); this.months=d.months; this.sitesByMonth=d.sites_by_month; },
+    selectSites(){ this.sites=this.sitesByMonth?.[this.form.month]||[]; if(!this.sites.includes(this.form.site)) this.form.site=''; },
+    async startRun(){
+      this.running = true; this.status.msg='Starting…';
+      try{
+        const r=await fetch('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(this.form)});
+        const d=await r.json(); if(!d.ok){ this.status.msg=d.msg||'Failed to start'; this.running=false; } else { this.status.msg='Running…'; }
+      }catch(e){ this.status.msg='Error starting'; this.running=false; }
+    },
+    async saveDefault(){
+      try{
+        const r=await fetch('/api/default',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({defaults:this.form})});
+        const d=await r.json(); this.status.msg = d.ok ? 'Defaults saved.' : (d.msg||'Failed');
+      }catch(e){ this.status.msg='Backend missing /api/default'; }
+    },
+    async loadDefaults(){
+      try{ const r=await fetch('/api/defaults'); if(r.ok){ Object.assign(this.form, await r.json()); this.status.msg='Loaded defaults'; } }catch(e){}
+    },
+    async fetchStatus(){ try{ const r=await fetch('/api/status'); const s=await r.json(); this.status=s; this.running=s.running; }catch(e){} },
+  }
+}
+</script>
+</body>
+</html>

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, re, threading, queue, uuid
+import os, re, uuid
 from pathlib import Path
 from typing import List, Dict
 from flask import Flask, render_template, request, Response, jsonify, send_file
@@ -11,12 +11,31 @@ from docx.shared import Inches, Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 import imagehash
 
-DATA_ROOT = Path(os.getenv("SAVE_ROOT", "/data/photos")).resolve()
-REPORT_ROOT = Path("/data/reports").resolve()
-REPORT_ROOT.mkdir(parents=True, exist_ok=True)
+try:
+    import importlib.util
+
+    from jobs.manager import JobManager
+    from projects.manager import ProjectManager
+    from storage.storage import Storage
+
+    queue_manager_path = Path(__file__).resolve().parent / "queue" / "manager.py"
+    spec = importlib.util.spec_from_file_location("local_queue_manager", queue_manager_path)
+    queue_manager_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(queue_manager_module)
+    QueueManager = queue_manager_module.QueueManager
+except ImportError:
+    from app.jobs.manager import JobManager
+    from app.projects.manager import ProjectManager
+    from app.queue.manager import QueueManager
+    from app.storage.storage import Storage
+
+storage = Storage()
+project_manager = ProjectManager()
+DATA_ROOT = storage.photos_root
+REPORT_ROOT = storage.ensure_dir(storage.reports_root)
 
 def list_dirs(p: Path):
-    return [d for d in sorted(p.iterdir()) if d.is_dir()]
+    return storage.list_dirs(p)
 
 def is_month_name(name: str) -> bool:
     import re
@@ -25,11 +44,12 @@ def is_month_name(name: str) -> bool:
 def scan_months_sites() -> Dict[str, list]:
     out = {}
     if not DATA_ROOT.exists(): return out
+    task_slugs = {task["slug"] for task in project_manager.list_tasks()}
     for m in list_dirs(DATA_ROOT):
         if not is_month_name(m.name): continue
         sites = []
         for s in list_dirs(m):
-            if (s / "grass_cutting").exists() or (s / "drainage_cleaning").exists():
+            if (task_slugs and any((s / task_slug).exists() for task_slug in task_slugs)) or any(child.is_dir() for child in list_dirs(s)):
                 sites.append(s.name)
         if sites:
             out[m.name] = sites
@@ -49,8 +69,7 @@ def crop_to_4x3(im: Image.Image) -> Image.Image:
 
 def load_images(folder: Path):
     exts = {".jpg",".jpeg",".png",".bmp",".tif",".tiff",".webp"}
-    if not folder.exists(): return []
-    return [p for p in sorted(folder.iterdir()) if p.suffix.lower() in exts]
+    return storage.list_files(folder, exts)
 
 def imread_gray_resized(path: Path):
     arr = cv2.imdecode(np.fromfile(str(path), dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
@@ -164,7 +183,7 @@ def build_report(input_root: Path, out_path: Path, company: str, zone: str, titl
             im = Image.open(before_path).convert("RGB"); im = crop_to_4x3(im)
             tmp = REPORT_ROOT / f"~tmp_b.jpg"; im.save(tmp, quality=90)
             cell = tbl.cell(0,0).paragraphs[0]; cell.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            cell.add_run().add_picture(str(tmp), width=max_w); tmp.unlink(missing_ok=True)
+            cell.add_run().add_picture(str(tmp), width=max_w); storage.unlink(tmp)
         except Exception:
             tbl.cell(0,0).text="(gambar gagal)"
         # right
@@ -172,7 +191,7 @@ def build_report(input_root: Path, out_path: Path, company: str, zone: str, titl
             im = Image.open(after_path).convert("RGB"); im = crop_to_4x3(im)
             tmp = REPORT_ROOT / f"~tmp_a.jpg"; im.save(tmp, quality=90)
             cell = tbl.cell(0,1).paragraphs[0]; cell.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-            cell.add_run().add_picture(str(tmp), width=max_w); tmp.unlink(missing_ok=True)
+            cell.add_run().add_picture(str(tmp), width=max_w); storage.unlink(tmp)
         except Exception:
             tbl.cell(0,1).text="(gambar gagal)"
         # labels
@@ -204,69 +223,126 @@ def build_report(input_root: Path, out_path: Path, company: str, zone: str, titl
 
 app = Flask(__name__)
 
-JOBS = {}
-EVENTS = {}
+job_manager = JobManager()
+queue_manager = QueueManager()
 
 def sse_stream(job_id):
-    q = EVENTS[job_id]
+    q = job_manager.get_events(job_id)
     yield f"event: ping\ndata: keepalive\n\n"
     while True:
         msg = q.get()
         yield f"data: {msg}\n\n"
 
 def push(job_id):
-    import json
-    q = EVENTS.get(job_id)
-    if q:
-        q.put(json.dumps(JOBS[job_id]))
+    state = job_manager.get_state(job_id)
+    if state:
+        job_manager.publish(job_id, dict(state))
 
 def run_job(job_id, month, site, task, company, zone, title, threshold):
     try:
-        from queue import Queue
-        JOBS[job_id].update(state="starting", done=0, total=0)
+        job = job_manager.get_state(job_id)
+        job.update(state="starting", done=0, total=0)
         push(job_id)
         input_root = DATA_ROOT / month / site / task
-        out_name = f"{month}_{site}_{'grass_cutting' if task=='grass_cutting' else 'drainage'}.docx"
+        out_name = f"{month}_{site}_{task}.docx"
         out_path = REPORT_ROOT / out_name
-        build_report(input_root, out_path, company, zone, title, threshold, JOBS[job_id])
+        build_report(input_root, out_path, company, zone, title, threshold, job)
         push(job_id)
     except Exception as e:
-        JOBS[job_id].update(state="error", error=str(e)); push(job_id)
+        job = job_manager.get_state(job_id)
+        if job:
+            job.update(state="error", error=str(e))
+        push(job_id)
 
 @app.route("/")
 def index():
     ms = scan_months_sites()
-    return render_template("index.html", months_sites=ms)
+    return render_template("index.html", months_sites=ms, tasks=project_manager.list_tasks())
+
+@app.get("/settings")
+def settings():
+    return render_template(
+        "settings.html",
+        companies=project_manager.list_companies(),
+        projects=project_manager.list_projects(),
+        sites=project_manager.list_sites(),
+        categories=project_manager.list_categories(),
+        tasks=project_manager.list_tasks(),
+    )
+
+@app.get("/api/settings/<entity>")
+def settings_list(entity):
+    try:
+        mapping = {
+            "companies": project_manager.list_companies,
+            "projects": project_manager.list_projects,
+            "sites": project_manager.list_sites,
+            "categories": project_manager.list_categories,
+            "tasks": project_manager.list_tasks,
+        }
+        return jsonify(ok=True, items=mapping[entity]())
+    except KeyError:
+        return jsonify(ok=False, error="Unknown settings entity"), 404
+
+@app.post("/api/settings/<entity>")
+def settings_create(entity):
+    data = request.get_json(silent=True) or request.form.to_dict()
+    try:
+        return jsonify(ok=True, item=project_manager.create(entity, data))
+    except Exception as exc:
+        return jsonify(ok=False, error=str(exc)), 400
+
+@app.put("/api/settings/<entity>/<item_id>")
+def settings_update(entity, item_id):
+    data = request.get_json(silent=True) or request.form.to_dict()
+    try:
+        return jsonify(ok=True, item=project_manager.update(entity, item_id, data))
+    except Exception as exc:
+        return jsonify(ok=False, error=str(exc)), 400
+
+@app.delete("/api/settings/<entity>/<item_id>")
+def settings_delete(entity, item_id):
+    try:
+        project_manager.delete(entity, item_id)
+        return jsonify(ok=True)
+    except Exception as exc:
+        return jsonify(ok=False, error=str(exc)), 400
 
 @app.post("/start")
 def start():
     data = request.form
     month = data.get("month","").strip()
     site  = data.get("site","").strip()
-    task  = data.get("task","grass_cutting").strip()
+    default_task = (project_manager.list_tasks() or [{"slug": ""}])[0]["slug"]
+    task  = data.get("task", default_task).strip()
     company = data.get("company","HW UNGGUL (901587-V)").strip()
     zone    = data.get("zone", f"{site} ZONE").strip()
-    title   = data.get("title","1. Grass Cutting" if task=="grass_cutting" else "2. Drainage Cleaning").strip()
+    task_row = project_manager.task_by_slug(task)
+    title   = data.get("title", (task_row or {}).get("title") or task.replace("_", " ").title()).strip()
     threshold = float(data.get("threshold","0.70"))
     if not month or not site:
         return jsonify({"ok": False, "error": "Please choose a month and a site"}), 400
     job_id = uuid.uuid4().hex
-    from queue import Queue
-    JOBS[job_id] = {"state":"queued","done":0,"total":0,"matched":0,"unmatched":0,"before":0,"after":0,"pages":0}
-    EVENTS[job_id] = Queue()
-    threading.Thread(target=run_job, args=(job_id, month, site, task, company, zone, title, threshold), daemon=True).start()
+    payload = {"month": month, "site": site, "task": task, "company": company, "zone": zone, "title": title, "threshold": threshold}
+    job_manager.create(
+        job_id,
+        name=f"{month} {site} {task}",
+        payload=payload,
+        state={"state":"queued","done":0,"total":0,"matched":0,"unmatched":0,"before":0,"after":0,"pages":0},
+    )
+    queue_manager.submit(run_job, job_id, month, site, task, company, zone, title, threshold)
     return jsonify({"ok": True, "job_id": job_id})
 
 @app.get("/progress/<job_id>")
 def progress(job_id):
-    if job_id not in EVENTS:
+    if not job_manager.get_events(job_id):
         return "no such job", 404
     return Response(sse_stream(job_id), mimetype="text/event-stream")
 
 @app.get("/download")
 def download():
     path = request.args.get("path")
-    if not path or not Path(path).exists():
+    if not path or not storage.exists(Path(path)):
         return "Not found", 404
     return send_file(path, as_attachment=True)
 

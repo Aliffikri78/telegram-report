@@ -21,6 +21,7 @@
 </head>
 <body>
   <h2>Telegram Report Builder</h2>
+  <p><a href="/settings">Settings</a></p>
   <div class="card">
     <form id="form">
       <div class="row">
@@ -40,8 +41,9 @@
         <div class="col">
           <label>Task</label>
           <select name="task" id="task">
-            <option value="grass_cutting">Grass Cutting</option>
-            <option value="drainage_cleaning">Drainage Cleaning</option>
+            {% for task in tasks %}
+            <option value="{{task.slug}}" data-title="{{task.title or task.name}}">{{task.name}}</option>
+            {% endfor %}
           </select>
         </div>
       </div>
@@ -96,7 +98,8 @@ function refreshSites(){
 }
 monthSel.addEventListener('change', refreshSites);
 taskSel.addEventListener('change', ()=>{
-  titleInp.value = taskSel.value === 'grass_cutting' ? '1. Grass Cutting' : '2. Drainage Cleaning';
+  const selected = taskSel.options[taskSel.selectedIndex];
+  titleInp.value = selected?.dataset?.title || selected?.textContent || '';
 });
 refreshSites();
 

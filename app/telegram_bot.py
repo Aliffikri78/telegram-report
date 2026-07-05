@@ -1,46 +1,54 @@
 #!/usr/bin/env python3
-import os, re, sys, logging
+import os, re, sys, logging, signal
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict
 from telegram import Update, Message
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
 
+try:
+    from download.manager import DownloadManager
+    from projects.manager import ProjectManager
+    from session.manager import SessionManager
+    from storage.storage import Storage
+except ImportError:
+    from app.download.manager import DownloadManager
+    from app.projects.manager import ProjectManager
+    from app.session.manager import SessionManager
+    from app.storage.storage import Storage
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("photo-bot")
 
-SITES: Dict[str, Dict[str,bool]] = {
-    'ALPHA':   {'alpha': True, 'a': True},
-    'BRAVO':   {'bravo': True, 'b': True},
-    'CHARLIE': {'charlie': True, 'c': True},
-    'DELTA':   {'delta': True, 'd': True},
-    'ECHO':    {'echo': True,  'e': True},
-}
-TASK_GRASS = 'grass_cutting'
-TASK_DRAIN = 'drainage_cleaning'
 BEFORE_WORDS = {'sebelum','sblm','sblum','sebelom','before'}
 AFTER_WORDS  = {'selepas','slps','slpas','after','lepas'}
 
 TIME_BEFORE_HOUR = int(os.getenv('TIME_BEFORE_HOUR','12'))
 TIME_AFTER_HOUR  = int(os.getenv('TIME_AFTER_HOUR','15'))
-SAVE_ROOT = Path(os.getenv('SAVE_ROOT','/data/photos')).resolve()
-
-CTX: Dict[int, Dict[str,str]] = {}
+storage = Storage()
+project_manager = ProjectManager()
+session_manager = SessionManager()
+download_manager = DownloadManager()
+SAVE_ROOT = storage.photos_root
 
 def set_ctx(chat_id:int, site:Optional[str]=None, task:Optional[str]=None, when:Optional[str]=None):
-    CTX.setdefault(chat_id, {})
-    if site: CTX[chat_id]['site'] = site
-    if task: CTX[chat_id]['task'] = task
-    if when: CTX[chat_id]['when'] = when
+    current = session_manager.get_session(chat_id)
+    if current:
+        session_manager.update_session(chat_id, site=site, task=task, when=when)
+    else:
+        session_manager.create_session(chat_id, site=site, task=task, when=when)
 
 def get_ctx(chat_id:int, key:str) -> Optional[str]:
-    return CTX.get(chat_id, {}).get(key)
+    return session_manager.get_session(chat_id).get(key)
 
 def all_aliases() -> Dict[str,str]:
     out={}
-    for site, aliases in SITES.items():
-        for alias in aliases:
-            out[alias.lower()]=site
+    import json
+    for site in project_manager.list_sites(project_manager.default_project_id()):
+        out[site["name"].lower()] = site["name"]
+        out[site["slug"].lower()] = site["name"]
+        for alias in json.loads(site.get("aliases") or "[]"):
+            out[alias.lower()] = site["name"]
     return out
 
 def normalize_when(word: Optional[str]) -> Optional[str]:
@@ -51,14 +59,8 @@ def normalize_when(word: Optional[str]) -> Optional[str]:
     return None
 
 def detect_site_free(text:str) -> Optional[str]:
-    aliases = all_aliases()
-    t=(text or '').lower()
-    for token in re.split(r'[\s,;/\-_.]+', t):
-        if token in aliases:
-            return aliases[token]
-    m=re.search(r'\bzone\s*([a-z])\b', t)
-    if m: return aliases.get(m.group(1).lower())
-    return None
+    site = project_manager.detect_site_free(text, project_manager.default_project_id())
+    return site["name"] if site else None
 
 def detect_when_fallback(caption:str, dt:datetime) -> str:
     t=(caption or '').lower()
@@ -69,19 +71,10 @@ def detect_when_fallback(caption:str, dt:datetime) -> str:
     return 'unknown'
 
 def target_dir(site:str, task:str, when:str, dt:datetime) -> Path:
-    month=dt.strftime('%Y-%m')
-    folder=SAVE_ROOT / month / site / task / (when if when in ('before','after') else 'unknown')
-    folder.mkdir(parents=True, exist_ok=True)
-    return folder
+    return storage.target_photo_dir(dt.strftime('%Y-%m'), site, task, when)
 
 def unique_path(path: Path) -> Path:
-    if not path.exists(): return path
-    stem, suf, parent = path.stem, path.suffix, path.parent
-    i=1
-    while True:
-        cand = parent / f"{stem}-{i}{suf}"
-        if not cand.exists(): return cand
-        i+=1
+    return storage.unique_path(path)
 
 async def cmd_start(update:Update, context:ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -102,23 +95,30 @@ async def cmd_addsite(update:Update, context:ContextTypes.DEFAULT_TYPE):
         return
     name = args[0].upper()
     shortcut = args[1].lower() if len(args) > 1 else None
-    if name in SITES:
+    project_id = project_manager.default_project_id()
+    if project_manager.find_site(name.lower(), project_id):
         await update.message.reply_text(f"Site exists: {name}")
         return
-    SITES[name] = {name.lower(): True}
-    if shortcut: SITES[name][shortcut] = True
+    aliases = [name.lower()]
+    if shortcut:
+        aliases.append(shortcut)
+    project_manager.create("sites", {"project_id": project_id, "name": name, "aliases": aliases})
     await update.message.reply_text(f"Added site: {name}" + (f" (/{shortcut})" if shortcut else ""))
 
 def parse_cmd_site_when(args):
     site=None; when=None
-    aliases = all_aliases()
     for tok in args:
         low=tok.lower()
-        if not site and low in aliases:
-            site = aliases[low]; continue
+        found = project_manager.find_site(low, project_manager.default_project_id())
+        if not site and found:
+            site = found["name"]; continue
         w = normalize_when(low)
         if not when and w: when = w
     return site, when
+
+def task_slug_for(command: str, fallback: str) -> str:
+    task = project_manager.task_by_command(command, project_manager.default_project_id())
+    return task["slug"] if task else fallback
 
 async def cmd_grass(update:Update, context:ContextTypes.DEFAULT_TYPE):
     site, when = parse_cmd_site_when(context.args or [])
@@ -126,8 +126,9 @@ async def cmd_grass(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if not site:
         await update.message.reply_text("Usage: /grass <site> <sebelum|selepas>\\nExample: /grass echo sebelum"); return
     if not when: when = 'before'
-    set_ctx(update.effective_chat.id, site=site, task=TASK_GRASS, when=when)
-    await update.message.reply_text(f"OK. Task=grass_cutting, Site={site}, When={when.upper()}. Send photos now.")
+    task = task_slug_for("grass", "grass")
+    set_ctx(update.effective_chat.id, site=site, task=task, when=when)
+    await update.message.reply_text(f"OK. Task={task}, Site={site}, When={when.upper()}. Send photos now.")
 
 async def cmd_drainage(update:Update, context:ContextTypes.DEFAULT_TYPE):
     site, when = parse_cmd_site_when(context.args or [])
@@ -135,12 +136,35 @@ async def cmd_drainage(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if not site:
         await update.message.reply_text("Usage: /drainage <site> <sebelum|selepas>\\nExample: /drainage delta selepas"); return
     if not when: when = 'before'
-    set_ctx(update.effective_chat.id, site=site, task=TASK_DRAIN, when=when)
-    await update.message.reply_text(f"OK. Task=drainage_cleaning, Site={site}, When={when.upper()}. Send photos now.")
+    task = task_slug_for("drainage", "drainage")
+    set_ctx(update.effective_chat.id, site=site, task=task, when=when)
+    await update.message.reply_text(f"OK. Task={task}, Site={site}, When={when.upper()}. Send photos now.")
+
+async def cmd_dynamic(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    command = (update.message.text or "").split()[0].lstrip("/").split("@")[0]
+    task_row = project_manager.task_by_command(command, project_manager.default_project_id())
+    if not task_row:
+        return
+    site, when = parse_cmd_site_when(context.args or [])
+    if not site:
+        site = detect_site_free(" ".join(context.args or []))
+    if not site:
+        await update.message.reply_text(f"Usage: /{command} <site> <sebelum|selepas>")
+        return
+    if not when:
+        when = 'before'
+    set_ctx(update.effective_chat.id, site=site, task=task_row["slug"], when=when)
+    await update.message.reply_text(f"OK. Task={task_row['slug']}, Site={site}, When={when.upper()}. Send photos now.")
 
 async def cmd_reset(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    CTX.pop(update.effective_chat.id, None)
+    session_manager.clear_session(update.effective_chat.id)
     await update.message.reply_text("Context cleared. Use /grass or /drainage again.")
+
+async def safe_reply(msg: Message, text: str):
+    try:
+        await msg.reply_text(text, quote=False)
+    except Exception as exc:
+        log.warning("Failed to send upload acknowledgement: %s", exc)
 
 async def handle_photo(update:Update, context:ContextTypes.DEFAULT_TYPE):
     msg: Message = update.message
@@ -150,28 +174,37 @@ async def handle_photo(update:Update, context:ContextTypes.DEFAULT_TYPE):
     dt = msg.date
 
     site = get_ctx(chat_id,'site') or detect_site_free(caption) or 'UNSPECIFIED'
-    task = get_ctx(chat_id,'task') or (TASK_DRAIN if any(k in caption.lower() for k in ('longkang','parit','drain')) else TASK_GRASS)
+    fallback_task = task_slug_for("drainage", "drainage") if any(k in caption.lower() for k in ('longkang','parit','drain')) else task_slug_for("grass", "grass")
+    task = get_ctx(chat_id,'task') or fallback_task
     when = get_ctx(chat_id,'when') or detect_when_fallback(caption, dt)
 
-    folder = target_dir(site, task, when, dt)
     ph = msg.photo[-1]
-    file = await ph.get_file()
-    ts = dt.strftime('%Y%m%d_%H%M%S')
-    uniq = getattr(ph, 'file_unique_id','') or 'nofid'
-    safe = re.sub(r'[^a-zA-Z0-9_-]+','_', caption.strip())[:40] or 'photo'
-    fname = f"{site.lower()}_{task}_{when}_{ts}_{uniq}_{safe}.jpg"
-    dest = unique_path(folder / fname)
+    uniq = getattr(ph, 'file_unique_id', None) or f"{chat_id}_{msg.message_id}_{ph.file_id}"
 
-    await file.download_to_drive(custom_path=str(dest))
-    log.info("Saved %s", dest)
-    try: await msg.reply_text(f"Saved: {dest}", quote=False)
-    except Exception: pass
+    result = download_manager.enqueue(
+        file_id=ph.file_id,
+        file_unique_id=uniq,
+        chat_id=chat_id,
+        user_id=msg.from_user.id if msg.from_user else None,
+        message_id=msg.message_id,
+        message_date=dt.isoformat(),
+        site=site,
+        task=task,
+        when=when,
+        caption=caption,
+    )
+    if result.get("duplicate"):
+        text = "Already queued/saved."
+    else:
+        text = "Queued for download."
+    context.application.create_task(safe_reply(msg, text))
 
 def main():
     token = os.getenv('TG_BOT_TOKEN')
     if not token:
         log.error("Missing env var: TG_BOT_TOKEN"); sys.exit(2)
-    SAVE_ROOT.mkdir(parents=True, exist_ok=True)
+    storage.ensure_dir(SAVE_ROOT)
+    download_manager.start(token)
 
     app = ApplicationBuilder().token(token).build()
     app.add_handler(CommandHandler('start',     cmd_start))
@@ -180,10 +213,15 @@ def main():
     app.add_handler(CommandHandler('grass',     cmd_grass))
     app.add_handler(CommandHandler('drainage',  cmd_drainage))
     app.add_handler(CommandHandler('reset',     cmd_reset))
+    app.add_handler(MessageHandler(filters.COMMAND, cmd_dynamic))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
     log.info("Bot up. Saving into %s", SAVE_ROOT)
-    app.run_polling()
+    stop_signals = None if os.name == "nt" else (signal.SIGINT, signal.SIGTERM)
+    try:
+        app.run_polling(stop_signals=stop_signals)
+    finally:
+        download_manager.stop()
 
 if __name__ == '__main__':
     try: main()

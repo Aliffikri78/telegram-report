@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
-import os, re, sys, logging
+import os, re, sys, logging, signal
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict
 from telegram import Update, Message
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
+
+try:
+    from download.manager import DownloadManager
+    from session.manager import SessionManager
+    from storage.storage import Storage
+except ImportError:
+    from app.download.manager import DownloadManager
+    from app.session.manager import SessionManager
+    from app.storage.storage import Storage
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("photo-bot")
@@ -23,18 +32,20 @@ AFTER_WORDS  = {'selepas','slps','slpas','after','lepas'}
 
 TIME_BEFORE_HOUR = int(os.getenv('TIME_BEFORE_HOUR','12'))
 TIME_AFTER_HOUR  = int(os.getenv('TIME_AFTER_HOUR','15'))
-SAVE_ROOT = Path(os.getenv('SAVE_ROOT','/data/photos')).resolve()
-
-CTX: Dict[int, Dict[str,str]] = {}
+storage = Storage()
+session_manager = SessionManager()
+download_manager = DownloadManager()
+SAVE_ROOT = storage.photos_root
 
 def set_ctx(chat_id:int, site:Optional[str]=None, task:Optional[str]=None, when:Optional[str]=None):
-    CTX.setdefault(chat_id, {})
-    if site: CTX[chat_id]['site'] = site
-    if task: CTX[chat_id]['task'] = task
-    if when: CTX[chat_id]['when'] = when
+    current = session_manager.get_session(chat_id)
+    if current:
+        session_manager.update_session(chat_id, site=site, task=task, when=when)
+    else:
+        session_manager.create_session(chat_id, site=site, task=task, when=when)
 
 def get_ctx(chat_id:int, key:str) -> Optional[str]:
-    return CTX.get(chat_id, {}).get(key)
+    return session_manager.get_session(chat_id).get(key)
 
 def all_aliases() -> Dict[str,str]:
     out={}
@@ -69,19 +80,10 @@ def detect_when_fallback(caption:str, dt:datetime) -> str:
     return 'unknown'
 
 def target_dir(site:str, task:str, when:str, dt:datetime) -> Path:
-    month=dt.strftime('%Y-%m')
-    folder=SAVE_ROOT / month / site / task / (when if when in ('before','after') else 'unknown')
-    folder.mkdir(parents=True, exist_ok=True)
-    return folder
+    return storage.target_photo_dir(dt.strftime('%Y-%m'), site, task, when)
 
 def unique_path(path: Path) -> Path:
-    if not path.exists(): return path
-    stem, suf, parent = path.stem, path.suffix, path.parent
-    i=1
-    while True:
-        cand = parent / f"{stem}-{i}{suf}"
-        if not cand.exists(): return cand
-        i+=1
+    return storage.unique_path(path)
 
 async def cmd_start(update:Update, context:ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -139,8 +141,14 @@ async def cmd_drainage(update:Update, context:ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"OK. Task=drainage_cleaning, Site={site}, When={when.upper()}. Send photos now.")
 
 async def cmd_reset(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    CTX.pop(update.effective_chat.id, None)
+    session_manager.clear_session(update.effective_chat.id)
     await update.message.reply_text("Context cleared. Use /grass or /drainage again.")
+
+async def safe_reply(msg: Message, text: str):
+    try:
+        await msg.reply_text(text, quote=False)
+    except Exception as exc:
+        log.warning("Failed to send upload acknowledgement: %s", exc)
 
 async def handle_photo(update:Update, context:ContextTypes.DEFAULT_TYPE):
     msg: Message = update.message
@@ -153,25 +161,33 @@ async def handle_photo(update:Update, context:ContextTypes.DEFAULT_TYPE):
     task = get_ctx(chat_id,'task') or (TASK_DRAIN if any(k in caption.lower() for k in ('longkang','parit','drain')) else TASK_GRASS)
     when = get_ctx(chat_id,'when') or detect_when_fallback(caption, dt)
 
-    folder = target_dir(site, task, when, dt)
     ph = msg.photo[-1]
-    file = await ph.get_file()
-    ts = dt.strftime('%Y%m%d_%H%M%S')
-    uniq = getattr(ph, 'file_unique_id','') or 'nofid'
-    safe = re.sub(r'[^a-zA-Z0-9_-]+','_', caption.strip())[:40] or 'photo'
-    fname = f"{site.lower()}_{task}_{when}_{ts}_{uniq}_{safe}.jpg"
-    dest = unique_path(folder / fname)
+    uniq = getattr(ph, 'file_unique_id', None) or f"{chat_id}_{msg.message_id}_{ph.file_id}"
 
-    await file.download_to_drive(custom_path=str(dest))
-    log.info("Saved %s", dest)
-    try: await msg.reply_text(f"Saved: {dest}", quote=False)
-    except Exception: pass
+    result = download_manager.enqueue(
+        file_id=ph.file_id,
+        file_unique_id=uniq,
+        chat_id=chat_id,
+        user_id=msg.from_user.id if msg.from_user else None,
+        message_id=msg.message_id,
+        message_date=dt.isoformat(),
+        site=site,
+        task=task,
+        when=when,
+        caption=caption,
+    )
+    if result.get("duplicate"):
+        text = "Already queued/saved."
+    else:
+        text = "Queued for download."
+    context.application.create_task(safe_reply(msg, text))
 
 def main():
     token = os.getenv('TG_BOT_TOKEN')
     if not token:
         log.error("Missing env var: TG_BOT_TOKEN"); sys.exit(2)
-    SAVE_ROOT.mkdir(parents=True, exist_ok=True)
+    storage.ensure_dir(SAVE_ROOT)
+    download_manager.start(token)
 
     app = ApplicationBuilder().token(token).build()
     app.add_handler(CommandHandler('start',     cmd_start))
@@ -183,7 +199,11 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
     log.info("Bot up. Saving into %s", SAVE_ROOT)
-    app.run_polling()
+    stop_signals = None if os.name == "nt" else (signal.SIGINT, signal.SIGTERM)
+    try:
+        app.run_polling(stop_signals=stop_signals)
+    finally:
+        download_manager.stop()
 
 if __name__ == '__main__':
     try: main()

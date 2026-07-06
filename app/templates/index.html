@@ -33,6 +33,7 @@
     .status-row{display:flex;align-items:center;gap:8px;font-size:14px}
     .dot{width:12px;height:12px;border-radius:50%;background:var(--green);display:inline-block}
     .dot.running{background:var(--amber)}
+    .dot.off{background:#9ca3af}
     .progress{height:16px;background:#e5e7eb;border-radius:999px;overflow:hidden;margin-top:12px}
     .bar{height:100%;background:var(--blue);width:0%;transition:width .2s ease}
     .stats{font-size:14px;color:var(--muted);margin-top:8px;line-height:1.6}
@@ -120,6 +121,13 @@
               <label><span>Match threshold</span>
                 <input name="threshold" type="number" step="0.01" min="0.5" max="0.95" value="{{defaults.threshold}}">
               </label>
+              <label><span>Matching backend</span>
+                <select name="backend" id="backend">
+                  <option value="cpu" selected>CPU</option>
+                  <option value="auto">Auto</option>
+                  <option value="gpu">GPU</option>
+                </select>
+              </label>
             </div>
           </form>
         </section>
@@ -141,6 +149,24 @@
           </div>
           <div class="progress"><div class="bar" id="bar"></div></div>
           <div class="stats" id="stats"></div>
+        </section>
+
+        <section class="card">
+          <h2>GPU</h2>
+          <div class="status-row">
+            <span class="dot off" id="gpuDot"></span>
+            <span id="gpuState">Checking...</span>
+          </div>
+          <div class="stats" id="gpuDetails"></div>
+        </section>
+
+        <section class="card">
+          <h2>Vision Analysis</h2>
+          <label><span>Near duplicate distance</span>
+            <input id="visionDistance" type="number" min="1" max="10" value="5">
+          </label>
+          <button class="mini-btn" id="analyzeImages" type="button" style="margin-top:10px">Analyze Images</button>
+          <div class="stats" id="visionSummary"></div>
         </section>
       </aside>
     </div>
@@ -208,6 +234,12 @@ const stateSpan = document.getElementById('state');
 const dot = document.getElementById('dot');
 const bar = document.getElementById('bar');
 const stats = document.getElementById('stats');
+const gpuDot = document.getElementById('gpuDot');
+const gpuState = document.getElementById('gpuState');
+const gpuDetails = document.getElementById('gpuDetails');
+const analyzeImages = document.getElementById('analyzeImages');
+const visionDistance = document.getElementById('visionDistance');
+const visionSummary = document.getElementById('visionSummary');
 const runBtn = document.getElementById('runBtn');
 const downloadLink = document.getElementById('downloadLink');
 const message = document.getElementById('message');
@@ -326,6 +358,60 @@ function updateCounts(counts){
   countFailed.textContent = counts?.failed ?? 0;
 }
 
+async function loadGpuStatus(){
+  try{
+    const r = await fetch('/api/system/gpu');
+    const d = await r.json();
+    const gpu = d.gpu || {};
+    gpuDot.classList.toggle('off', !gpu.nvidia_detected);
+    gpuState.textContent = gpu.nvidia_detected ? (gpu.gpu_name || 'NVIDIA GPU detected') : 'No NVIDIA GPU detected';
+    gpuDetails.innerHTML = `
+      NVIDIA GPU: <code>${gpu.nvidia_detected ? 'Detected' : 'Not detected'}</code><br>
+      OpenCV CUDA: <code>${gpu.opencv_cuda_available ? 'Available' : 'CPU fallback'}</code><br>
+      CUDA devices: <code>${gpu.opencv_cuda_device_count || 0}</code>
+      ${gpu.error ? `<br>Error: <code>${escapeHtml(gpu.error)}</code>` : ''}
+    `;
+  }catch(e){
+    gpuDot.classList.add('off');
+    gpuState.textContent = 'GPU status unavailable';
+    gpuDetails.textContent = '';
+  }
+}
+
+async function analyzeCurrentImages(){
+  if(!monthSel.value || !siteSel.value || !taskSel.value){
+    visionSummary.textContent = 'Choose month, site, and task first.';
+    return;
+  }
+  visionSummary.textContent = 'Analyzing...';
+  const body = new URLSearchParams({
+    month: monthSel.value,
+    site: siteSel.value,
+    task: taskSel.value,
+    max_distance: visionDistance.value || '5',
+  });
+  try{
+    const r = await fetch('/api/vision/analyze', {method:'POST', body});
+    const d = await r.json();
+    if(!d.ok){
+      visionSummary.textContent = d.error || 'Analysis failed.';
+      return;
+    }
+    visionSummary.innerHTML = `
+      Images: <code>${d.summary?.images || 0}</code><br>
+      Duplicate Groups: <code>${d.summary?.duplicate_groups || 0}</code><br>
+      Similar Groups: <code>${d.summary?.similar_groups || 0}</code><br>
+      Blurred: <code>${d.summary?.blurred || 0}</code><br>
+      Dark: <code>${d.summary?.dark || 0}</code><br>
+      Best Photos: <code>${d.summary?.best_images || 0}</code><br>
+      Time: <code>${d.metrics?.analysis_time_ms || 0} ms</code><br>
+      Cache: <code>${d.metrics?.cache_hits || 0}</code> hits / <code>${d.metrics?.cache_misses || 0}</code> misses
+    `;
+  }catch(e){
+    visionSummary.textContent = 'Analysis failed.';
+  }
+}
+
 async function loadJobs(){
   try{
     const params = new URLSearchParams({limit: '25'});
@@ -382,7 +468,7 @@ function followJob(jobId){
     const done = d.done || 0;
     const pct = total > 0 ? Math.round(100 * done / total) : (d.state === 'done' ? 100 : 0);
     bar.style.width = pct + '%';
-    stats.innerHTML = `Before: <code>${d.before || 0}</code> &nbsp; After: <code>${d.after || 0}</code><br>Matched: <code>${d.matched || 0}</code> &nbsp; Fallback: <code>${d.unmatched || 0}</code> &nbsp; Pages: <code>${d.pages || 1}</code>`;
+    stats.innerHTML = `Before: <code>${d.before || 0}</code> &nbsp; After: <code>${d.after || 0}</code><br>Matched: <code>${d.matched || 0}</code> &nbsp; Fallback: <code>${d.unmatched || 0}</code> &nbsp; Pages: <code>${d.pages || 1}</code><br>Backend: <code>${d.backend_used || 'cpu'}</code>${d.backend_note ? ` &nbsp; <span>${escapeHtml(d.backend_note)}</span>` : ''}`;
 
     if(d.state === 'done' && d.download){
       downloadLink.href = '/download?path=' + encodeURIComponent(d.download);
@@ -420,6 +506,7 @@ function setJobAutoRefresh(enabled){
 
 monthSel.addEventListener('change', refreshSites);
 refreshFolders.addEventListener('click', scanFolders);
+analyzeImages.addEventListener('click', analyzeCurrentImages);
 siteSel.addEventListener('change', refreshZone);
 taskSel.addEventListener('change', refreshTitle);
 refreshJobs.addEventListener('click', loadJobs);
@@ -443,6 +530,7 @@ jobRows.addEventListener('click', (event)=>{
 });
 refreshMonths();
 refreshTitle();
+loadGpuStatus();
 loadJobs();
 setJobAutoRefresh(autoRefreshJobs.checked);
 

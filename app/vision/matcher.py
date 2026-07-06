@@ -1,4 +1,5 @@
 import os
+import time
 from pathlib import Path
 from typing import Callable, Dict, List, Tuple
 
@@ -20,9 +21,19 @@ MATCH_WEIGHT_ORB = float(os.getenv("MATCH_WEIGHT_ORB", "0.40"))
 MATCH_WEIGHT_HIST = float(os.getenv("MATCH_WEIGHT_HIST", "0.20"))
 MATCH_WEIGHT_SSIM = float(os.getenv("MATCH_WEIGHT_SSIM", "0.10"))
 MATCH_WEIGHT_EDGE = float(os.getenv("MATCH_WEIGHT_EDGE", "0.10"))
+MATCH_ASSIGNMENT = os.getenv("MATCH_ASSIGNMENT", "greedy").strip().lower()
 
 Pair = Tuple[Path, Path, float]
 VALID_BACKENDS = {"auto", "cpu", "gpu"}
+VALID_ASSIGNMENTS = {"greedy", "hungarian", "auto"}
+
+
+def get_linear_sum_assignment():
+    try:
+        from scipy.optimize import linear_sum_assignment
+        return linear_sum_assignment
+    except Exception:
+        return None
 
 
 def opencv_cuda_available() -> bool:
@@ -349,7 +360,255 @@ def choose_candidate(candidate_ids, be_path, be_hash, af_items, be_kp, be_desc, 
         if detail["final_score"] >= threshold and geometry_ok:
             if best_accept is None or detail["final_score"] > best_accept["final_score"]:
                 best_accept = detail
-    return best_accept, best_debug
+    return best_accept, best_debug, len(details)
+
+
+def match_detail(before: Path, after: Path, detail: Dict) -> Dict:
+    confidence = max(0.0, min(100.0, float(detail.get("final_score", 0.0)) * 100.0))
+    return {
+        "before": str(before),
+        "after": str(after),
+        "final_score": round(float(detail.get("final_score", 0.0)), 4),
+        "phash_similarity": round(float(detail.get("phash_similarity", 0.0)), 4),
+        "orb_score": round(float(detail.get("orb_score", 0.0)), 4),
+        "histogram_score": round(float(detail.get("histogram_score", 0.0)), 4),
+        "ssim_score": round(float(detail.get("ssim_score", 0.0)), 4),
+        "edge_score": round(float(detail.get("edge_score", 0.0)), 4),
+        "confidence": round(confidence, 1),
+        "good_matches": int(detail.get("good_matches", 0)),
+        "inliers": int(detail.get("inliers", 0)),
+    }
+
+
+def update_matching_metrics(progress: Dict, start_time: float, total_images: int, candidate_comparisons: int) -> None:
+    elapsed = max(0.0, time.perf_counter() - start_time)
+    confidences = [float(item.get("confidence", 0.0)) for item in progress.get("match_debug", [])]
+    progress["matching_time_sec"] = round(elapsed, 3)
+    progress["avg_time_per_image_sec"] = round(elapsed / total_images, 3) if total_images else 0.0
+    progress["images_per_sec"] = round(total_images / elapsed, 3) if elapsed > 0 else 0.0
+    progress["candidate_comparisons"] = candidate_comparisons
+    progress["cache_hits"] = progress.get("cache_hits", 0)
+    progress["average_confidence"] = round(sum(confidences) / len(confidences), 1) if confidences else 0.0
+    progress["lowest_confidence"] = round(min(confidences), 1) if confidences else 0.0
+    progress["highest_confidence"] = round(max(confidences), 1) if confidences else 0.0
+
+
+def reset_assignment_progress(progress: Dict, method: str) -> None:
+    progress.update(done=0, matched=0, unmatched=0, unmatched_debug=[], match_debug=[], assignment_method=method)
+
+
+def assignment_snapshot(progress: Dict) -> Dict:
+    return {
+        "done": progress.get("done", 0),
+        "matched": progress.get("matched", 0),
+        "unmatched": progress.get("unmatched", 0),
+        "unmatched_debug": list(progress.get("unmatched_debug", [])),
+        "match_debug": list(progress.get("match_debug", [])),
+        "assignment_method": progress.get("assignment_method"),
+        "candidate_comparisons": progress.get("candidate_comparisons", 0),
+        "average_confidence": progress.get("average_confidence", 0.0),
+        "lowest_confidence": progress.get("lowest_confidence", 0.0),
+        "highest_confidence": progress.get("highest_confidence", 0.0),
+    }
+
+
+def restore_assignment_snapshot(progress: Dict, snapshot: Dict) -> None:
+    progress.update(snapshot)
+
+
+def geometry_ok(detail: Dict) -> bool:
+    return detail.get("spatial_verified") or not ORB_VERIFY_GEOMETRY
+
+
+def build_global_candidates(
+    befores,
+    afters,
+    be_ph,
+    af_ph,
+    be_kp,
+    be_desc,
+    af_kp,
+    af_desc,
+    be_gray,
+    af_gray,
+    progress,
+    should_cancel,
+    cancelled_exception,
+    match_start,
+    total_images,
+):
+    af_items = list(zip(afters, af_ph))
+    rows = []
+    candidate_comparisons = 0
+    for idx, b in enumerate(befores):
+        if should_cancel():
+            raise cancelled_exception("Cancelled by user")
+        details = []
+        for j, (apath, ahash) in enumerate(af_items):
+            detail = candidate_score(
+                hamming(be_ph[idx], ahash),
+                be_kp.get(b),
+                be_desc.get(b),
+                af_kp.get(apath),
+                af_desc.get(apath),
+                be_gray.get(b),
+                af_gray.get(apath),
+            )
+            detail["candidate"] = str(apath)
+            detail["candidate_index"] = j
+            details.append(detail)
+        apply_final_scores(details)
+        rows.append(details)
+        candidate_comparisons += len(details)
+        progress["done"] = idx + 1
+        update_matching_metrics(progress, match_start, total_images, candidate_comparisons)
+    return rows, candidate_comparisons
+
+
+def apply_hungarian_assignment(befores, afters, rows, threshold, progress):
+    score_matrix = np.array([[float(detail.get("final_score", 0.0)) for detail in row] for row in rows], dtype=np.float32)
+    if score_matrix.size == 0:
+        return []
+
+    linear_sum_assignment = get_linear_sum_assignment()
+    if linear_sum_assignment is None:
+        return None
+
+    before_ids, after_ids = linear_sum_assignment(-score_matrix)
+    pairs = []
+    assigned_before = set()
+    for before_idx, after_idx in zip(before_ids, after_ids):
+        detail = rows[before_idx][after_idx]
+        assigned_before.add(before_idx)
+        if detail["final_score"] >= threshold and geometry_ok(detail):
+            pairs.append((befores[before_idx], afters[after_idx], detail["final_score"]))
+            progress["match_debug"].append(match_detail(befores[before_idx], afters[after_idx], detail))
+            progress["matched"] += 1
+        else:
+            progress["unmatched"] += 1
+            progress["unmatched_debug"].append(unmatched_debug(befores[before_idx], detail, threshold))
+
+    for before_idx, b in enumerate(befores):
+        if before_idx in assigned_before:
+            continue
+        best_debug = max(rows[before_idx], key=lambda detail: detail.get("final_score", 0.0), default=None)
+        progress["unmatched"] += 1
+        progress["unmatched_debug"].append(unmatched_debug(b, best_debug, threshold))
+    return pairs
+
+
+def run_hungarian_assignment(
+    befores,
+    afters,
+    be_ph,
+    af_ph,
+    be_kp,
+    be_desc,
+    af_kp,
+    af_desc,
+    be_gray,
+    af_gray,
+    threshold,
+    progress,
+    should_cancel,
+    cancelled_exception,
+    match_start,
+    total_images,
+):
+    rows, candidate_comparisons = build_global_candidates(
+        befores,
+        afters,
+        be_ph,
+        af_ph,
+        be_kp,
+        be_desc,
+        af_kp,
+        af_desc,
+        be_gray,
+        af_gray,
+        progress,
+        should_cancel,
+        cancelled_exception,
+        match_start,
+        total_images,
+    )
+    pairs = apply_hungarian_assignment(befores, afters, rows, threshold, progress)
+    if pairs is None:
+        return None, candidate_comparisons
+    return pairs, candidate_comparisons
+
+
+def apply_greedy_assignment(
+    befores,
+    afters,
+    be_ph,
+    af_ph,
+    be_kp,
+    be_desc,
+    af_kp,
+    af_desc,
+    be_gray,
+    af_gray,
+    threshold,
+    progress,
+    should_cancel,
+    cancelled_exception,
+    match_start,
+    total_images,
+):
+    pairs = []
+    used = {}
+    candidate_comparisons = 0
+    af_items = list(zip(afters, af_ph))
+    for idx, b in enumerate(befores):
+        if should_cancel():
+            raise cancelled_exception("Cancelled by user")
+        dlist = [(j, hamming(be_ph[idx], aph)) for j, (_, aph) in enumerate(af_items) if not used.get(j)]
+        dlist.sort(key=lambda x: x[1])
+        primary = [j for j, _ in dlist[:max(1, TOPK)]]
+        accepted, debug, compared = choose_candidate(
+            primary,
+            b,
+            be_ph[idx],
+            af_items,
+            be_kp,
+            be_desc,
+            af_kp,
+            af_desc,
+            be_gray,
+            af_gray,
+            threshold,
+        )
+        candidate_comparisons += compared
+        if accepted is None and SECOND_PASS > TOPK:
+            expanded = [j for j, _ in dlist[:max(1, SECOND_PASS)]]
+            accepted, debug, compared = choose_candidate(
+                expanded,
+                b,
+                be_ph[idx],
+                af_items,
+                be_kp,
+                be_desc,
+                af_kp,
+                af_desc,
+                be_gray,
+                af_gray,
+                threshold,
+            )
+            candidate_comparisons += compared
+        if accepted is not None:
+            best_j = accepted["candidate_index"]
+            best_s = accepted["final_score"]
+            used[best_j] = True
+            pairs.append((b, afters[best_j], best_s))
+            progress["match_debug"].append(match_detail(b, afters[best_j], accepted))
+            progress["matched"] += 1
+        else:
+            progress["unmatched"] += 1
+            progress["unmatched_debug"].append(unmatched_debug(b, debug, threshold))
+        progress["done"] = idx + 1
+        update_matching_metrics(progress, match_start, total_images, candidate_comparisons)
+    return pairs, candidate_comparisons
 
 
 def match_pairs(
@@ -361,6 +620,8 @@ def match_pairs(
     cancelled_exception,
     backend: str = "cpu",
 ) -> List[Pair]:
+    match_start = time.perf_counter()
+    candidate_comparisons = 0
     threshold = max(0.50, float(threshold or 0.0))
     backend_requested, backend_used, backend_note = resolve_backend(backend)
     progress.update(
@@ -395,37 +656,79 @@ def match_pairs(
         af_kp[p] = k or []
         af_desc[p] = d
 
-    progress.update(state="matching", done=0, matched=0, unmatched=0, unmatched_debug=[])
+    progress.update(
+        state="matching",
+        done=0,
+        matched=0,
+        unmatched=0,
+        unmatched_debug=[],
+        match_debug=[],
+        matching_time_sec=0.0,
+        avg_time_per_image_sec=0.0,
+        images_per_sec=0.0,
+        candidate_comparisons=0,
+        cache_hits=0,
+        average_confidence=0.0,
+        lowest_confidence=0.0,
+        highest_confidence=0.0,
+        assignment_method="greedy",
+        greedy_accepted=0,
+        hungarian_accepted=0,
+    )
 
-    pairs = []
-    used = {}
-    af_items = list(zip(afters, af_ph))
-    for idx, b in enumerate(befores):
-        if should_cancel():
-            raise cancelled_exception("Cancelled by user")
-        dlist = [(j, hamming(be_ph[idx], aph)) for j, (_, aph) in enumerate(af_items) if not used.get(j)]
-        dlist.sort(key=lambda x: x[1])
-        primary = [j for j, _ in dlist[:max(1, TOPK)]]
-        accepted, debug = choose_candidate(
-            primary,
-            b,
-            be_ph[idx],
-            af_items,
-            be_kp,
-            be_desc,
-            af_kp,
-            af_desc,
-            be_gray,
-            af_gray,
-            threshold,
-        )
-        if accepted is None and SECOND_PASS > TOPK:
-            expanded = [j for j, _ in dlist[:max(1, SECOND_PASS)]]
-            accepted, debug = choose_candidate(
-                expanded,
-                b,
-                be_ph[idx],
-                af_items,
+    total_images = len(befores) + len(afters)
+    assignment_mode = MATCH_ASSIGNMENT if MATCH_ASSIGNMENT in VALID_ASSIGNMENTS else "greedy"
+    if assignment_mode == "hungarian" and get_linear_sum_assignment() is not None:
+        try:
+            reset_assignment_progress(progress, "hungarian")
+            pairs, candidate_comparisons = run_hungarian_assignment(
+                befores,
+                afters,
+                be_ph,
+                af_ph,
+                be_kp,
+                be_desc,
+                af_kp,
+                af_desc,
+                be_gray,
+                af_gray,
+                progress,
+                should_cancel,
+                cancelled_exception,
+                match_start,
+                total_images,
+            )
+            if pairs is None:
+                reset_assignment_progress(progress, "greedy_fallback")
+                pairs, candidate_comparisons = apply_greedy_assignment(
+                    befores,
+                    afters,
+                    be_ph,
+                    af_ph,
+                    be_kp,
+                    be_desc,
+                    af_kp,
+                    af_desc,
+                    be_gray,
+                    af_gray,
+                    threshold,
+                    progress,
+                    should_cancel,
+                    cancelled_exception,
+                    match_start,
+                    total_images,
+                )
+            progress["hungarian_accepted"] = len(pairs)
+            progress["greedy_accepted"] = 0
+        except Exception as exc:
+            if isinstance(exc, cancelled_exception):
+                raise
+            reset_assignment_progress(progress, "greedy_fallback")
+            pairs, candidate_comparisons = apply_greedy_assignment(
+                befores,
+                afters,
+                be_ph,
+                af_ph,
                 be_kp,
                 be_desc,
                 af_kp,
@@ -433,16 +736,103 @@ def match_pairs(
                 be_gray,
                 af_gray,
                 threshold,
+                progress,
+                should_cancel,
+                cancelled_exception,
+                match_start,
+                total_images,
             )
-        if accepted is not None:
-            best_j = accepted["candidate_index"]
-            best_s = accepted["final_score"]
-            used[best_j] = True
-            pairs.append((b, afters[best_j], best_s))
-            progress["matched"] += 1
-        else:
-            progress["unmatched"] += 1
-            progress["unmatched_debug"].append(unmatched_debug(b, debug, threshold))
-        progress["done"] = idx + 1
+            progress["greedy_accepted"] = len(pairs)
+            progress["hungarian_accepted"] = 0
+    elif assignment_mode == "auto" and get_linear_sum_assignment() is not None:
+        reset_assignment_progress(progress, "greedy")
+        greedy_pairs, greedy_comparisons = apply_greedy_assignment(
+            befores,
+            afters,
+            be_ph,
+            af_ph,
+            be_kp,
+            be_desc,
+            af_kp,
+            af_desc,
+            be_gray,
+            af_gray,
+            threshold,
+            progress,
+            should_cancel,
+            cancelled_exception,
+            match_start,
+            total_images,
+        )
+        greedy_snapshot = assignment_snapshot(progress)
+        greedy_snapshot["greedy_accepted"] = len(greedy_pairs)
+
+        try:
+            reset_assignment_progress(progress, "hungarian")
+            hungarian_pairs, hungarian_comparisons = run_hungarian_assignment(
+                befores,
+                afters,
+                be_ph,
+                af_ph,
+                be_kp,
+                be_desc,
+                af_kp,
+                af_desc,
+                be_gray,
+                af_gray,
+                threshold,
+                progress,
+                should_cancel,
+                cancelled_exception,
+                match_start,
+                total_images,
+            )
+            hungarian_count = len(hungarian_pairs or [])
+            if hungarian_pairs is not None and hungarian_count > len(greedy_pairs):
+                pairs = hungarian_pairs
+                candidate_comparisons = greedy_comparisons + hungarian_comparisons
+                progress["assignment_method"] = "hungarian"
+                progress["greedy_accepted"] = len(greedy_pairs)
+                progress["hungarian_accepted"] = hungarian_count
+            else:
+                pairs = greedy_pairs
+                candidate_comparisons = greedy_comparisons + (hungarian_comparisons if hungarian_pairs is not None else 0)
+                restore_assignment_snapshot(progress, greedy_snapshot)
+                progress["assignment_method"] = "greedy"
+                progress["greedy_accepted"] = len(greedy_pairs)
+                progress["hungarian_accepted"] = hungarian_count
+        except Exception as exc:
+            if isinstance(exc, cancelled_exception):
+                raise
+            pairs = greedy_pairs
+            candidate_comparisons = greedy_comparisons
+            restore_assignment_snapshot(progress, greedy_snapshot)
+            progress["assignment_method"] = "greedy"
+            progress["greedy_accepted"] = len(greedy_pairs)
+            progress["hungarian_accepted"] = 0
+    else:
+        reset_assignment_progress(progress, "greedy")
+        pairs, candidate_comparisons = apply_greedy_assignment(
+            befores,
+            afters,
+            be_ph,
+            af_ph,
+            be_kp,
+            be_desc,
+            af_kp,
+            af_desc,
+            be_gray,
+            af_gray,
+            threshold,
+            progress,
+            should_cancel,
+            cancelled_exception,
+            match_start,
+            total_images,
+        )
+        progress["greedy_accepted"] = len(pairs)
+        progress["hungarian_accepted"] = 0
+
+    update_matching_metrics(progress, match_start, total_images, candidate_comparisons)
 
     return pairs

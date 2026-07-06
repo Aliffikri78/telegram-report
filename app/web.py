@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-import os, re, uuid
+import os, re, threading, uuid
 from pathlib import Path
 from typing import List, Dict
+from urllib import parse, request as urlrequest
 from flask import Flask, render_template, request, Response, jsonify, send_file
 
 from PIL import Image
 import cv2, numpy as np
 from docx import Document
-from docx.shared import Inches, Pt
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.shared import Cm, Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
+from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ALIGN_VERTICAL
 import imagehash
 
 try:
@@ -39,26 +41,72 @@ def list_dirs(p: Path):
 
 def is_month_name(name: str) -> bool:
     import re
-    return re.match(r"^\\d{4}-\\d{2}$", name) is not None
+    return re.match(r"^\d{4}-\d{2}$", name) is not None
 
 def scan_months_sites() -> Dict[str, list]:
     out = {}
     if not DATA_ROOT.exists(): return out
-    task_slugs = {task["slug"] for task in project_manager.list_tasks()}
+    configured = {task["slug"] for task in project_manager.list_tasks()}
+    legacy = {"grass_cutting", "drainage_cleaning"}
+    task_slugs = configured | legacy
     for m in list_dirs(DATA_ROOT):
         if not is_month_name(m.name): continue
         sites = []
         for s in list_dirs(m):
-            if (task_slugs and any((s / task_slug).exists() for task_slug in task_slugs)) or any(child.is_dir() for child in list_dirs(s)):
+            if any((s / task_slug).exists() for task_slug in task_slugs):
                 sites.append(s.name)
         if sites:
             out[m.name] = sites
     return out
 
+def report_tasks():
+    tasks = project_manager.list_tasks()
+    by_slug = {task["slug"]: task for task in tasks}
+    ordered = []
+    for slug in ("grass_cutting", "drainage_cleaning"):
+        if slug in by_slug:
+            ordered.append(by_slug.pop(slug))
+    ordered.extend(by_slug.values())
+    return ordered
+
+def report_defaults():
+    tasks = report_tasks()
+    default_task = next(
+        (task for task in tasks if task["slug"] == "grass_cutting"),
+        tasks[0] if tasks else {"slug": "", "title": "1. Grass Cutting", "name": "Grass Cutting"},
+    )
+    return {
+        "company": os.getenv("COMPANY", "HW UNGGUL (901587-V)"),
+        "zone": "ZONE",
+        "title": default_task.get("title") or default_task.get("name") or "1. Grass Cutting",
+        "threshold": os.getenv("THRESHOLD", "0.70"),
+        "task": default_task["slug"],
+    }
+
 MAX_SIDE = int(os.getenv("FAST_MAX_SIDE", "1600"))
 NFEATURES = int(os.getenv("FAST_NFEATURES", "600"))
 TOPK = int(os.getenv("FAST_TOPK", "5"))
 RATIO = float(os.getenv("FAST_RATIO", "0.75"))
+IMG_H_CM = float(os.getenv("IMG_H_CM", "4.3"))
+
+class CancelledJob(Exception):
+    pass
+
+def notify_telegram(message: str) -> None:
+    token = os.getenv("TG_BOT_TOKEN")
+    chat_id = os.getenv("TG_CHAT_ID")
+    if not token or not chat_id:
+        return
+
+    def send():
+        try:
+            data = parse.urlencode({"chat_id": chat_id, "text": message}).encode("utf-8")
+            req = urlrequest.Request(f"https://api.telegram.org/bot{token}/sendMessage", data=data)
+            urlrequest.urlopen(req, timeout=5).close()
+        except Exception:
+            pass
+
+    threading.Thread(target=send, daemon=True).start()
 
 def crop_to_4x3(im: Image.Image) -> Image.Image:
     w,h = im.size; target = 4/3; cur = w/h
@@ -103,7 +151,10 @@ def score_pair(des_a, des_b) -> float:
     return min(1.0, good/200.0)
 
 def build_report(input_root: Path, out_path: Path, company: str, zone: str, title: str,
-                 threshold: float, progress: dict):
+                 threshold: float, progress: dict, should_cancel=None):
+    should_cancel = should_cancel or (lambda: False)
+    if should_cancel():
+        raise CancelledJob("Cancelled by user")
     before_dir = input_root / "before"
     after_dir  = input_root / "after"
     befores = load_images(before_dir)
@@ -120,12 +171,16 @@ def build_report(input_root: Path, out_path: Path, company: str, zone: str, titl
     be_desc, af_desc = {}, {}
 
     for p in befores:
+        if should_cancel():
+            raise CancelledJob("Cancelled by user")
         be_ph.append(phash(p))
         arr = imread_gray_resized(p)
         k, d = orb.detectAndCompute(arr, None) if arr is not None else (None,None)
         be_desc[p] = d
 
     for p in afters:
+        if should_cancel():
+            raise CancelledJob("Cancelled by user")
         af_ph.append(phash(p))
         arr = imread_gray_resized(p)
         k, d = orb.detectAndCompute(arr, None) if arr is not None else (None,None)
@@ -137,6 +192,8 @@ def build_report(input_root: Path, out_path: Path, company: str, zone: str, titl
     used = {}
     af_items = list(zip(afters, af_ph))
     for idx, b in enumerate(befores):
+        if should_cancel():
+            raise CancelledJob("Cancelled by user")
         dlist = [(j, hamming(be_ph[idx], aph)) for j,(_,aph) in enumerate(af_items) if not used.get(j)]
         dlist.sort(key=lambda x: x[1])
         cand = [j for j,_ in dlist[:max(1, TOPK)]]
@@ -151,73 +208,90 @@ def build_report(input_root: Path, out_path: Path, company: str, zone: str, titl
             pairs.append((b, afters[best_j], best_s))
             progress["matched"] += 1
         else:
-            j = idx if (idx < len(afters) and not used.get(idx)) else None
-            if j is not None:
-                used[j] = True
-                pairs.append((b, afters[j], -1.0))
-                progress["unmatched"] += 1
+            progress["unmatched"] += 1
         progress["done"] = idx + 1
 
-    # DOCX (table layout)
     doc = Document()
+    for section in doc.sections:
+        section.top_margin = Cm(2.0)
+        section.bottom_margin = Cm(2.0)
+        section.right_margin = Cm(2.0)
+        section.left_margin = Cm(3.0)
+        section.header_distance = Cm(1.0)
+        section.footer_distance = Cm(1.0)
+    normal = doc.styles["Normal"].paragraph_format
+    normal.space_before = Pt(0)
+    normal.space_after = Pt(0)
+    normal.line_spacing_rule = WD_LINE_SPACING.SINGLE
+
     def add_header(company, zone):
-        p = doc.add_paragraph(); r=p.add_run(company.upper()); r.bold=True; r.font.size=Pt(14)
+        p = doc.add_paragraph(); r=p.add_run(company.upper()); r.font.size=Pt(14)
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        p2 = doc.add_paragraph(zone.upper()); p2.alignment = WD_ALIGN_PARAGRAPH.CENTER; p2.runs[0].font.size=Pt(12)
+        p2 = doc.add_paragraph()
+        r2 = p2.add_run(zone.upper())
+        r2.bold = True
+        r2.underline = True
+        r2.font.size = Pt(12)
+        p2.alignment = WD_ALIGN_PARAGRAPH.CENTER
     def add_title(title):
         p = doc.add_paragraph(); r=p.add_run(title); r.bold=True; r.font.size=Pt(12); p.alignment = WD_ALIGN_PARAGRAPH.LEFT
     def add_pair_table(before_path, after_path):
         from docx.oxml.shared import OxmlElement, qn
-        sec = doc.sections[-1]
-        gutter = Inches(0.3)
-        max_w = (sec.page_width - sec.left_margin - sec.right_margin - gutter) / 2
         tbl = doc.add_table(rows=2, cols=2)
-        # borderless
+        tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
+        for row in tbl.rows:
+            for cell in row.cells:
+                cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
         tbl_pr = tbl._tbl.tblPr
         borders = OxmlElement('w:tblBorders')
         for edge in ('top','left','bottom','right','insideH','insideV'):
             el = OxmlElement(f'w:{edge}'); el.set(qn('w:val'), 'nil'); borders.append(el)
         tbl_pr.append(borders)
-        # left
         try:
             im = Image.open(before_path).convert("RGB"); im = crop_to_4x3(im)
             tmp = REPORT_ROOT / f"~tmp_b.jpg"; im.save(tmp, quality=90)
-            cell = tbl.cell(0,0).paragraphs[0]; cell.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            cell.add_run().add_picture(str(tmp), width=max_w); storage.unlink(tmp)
+            cell = tbl.cell(0,0).paragraphs[0]; cell.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            cell.add_run().add_picture(str(tmp), height=Cm(IMG_H_CM)); storage.unlink(tmp)
         except Exception:
             tbl.cell(0,0).text="(gambar gagal)"
-        # right
         try:
             im = Image.open(after_path).convert("RGB"); im = crop_to_4x3(im)
             tmp = REPORT_ROOT / f"~tmp_a.jpg"; im.save(tmp, quality=90)
-            cell = tbl.cell(0,1).paragraphs[0]; cell.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-            cell.add_run().add_picture(str(tmp), width=max_w); storage.unlink(tmp)
+            cell = tbl.cell(0,1).paragraphs[0]; cell.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            cell.add_run().add_picture(str(tmp), height=Cm(IMG_H_CM)); storage.unlink(tmp)
         except Exception:
             tbl.cell(0,1).text="(gambar gagal)"
-        # labels
         pL = tbl.cell(1,0).paragraphs[0]; pL.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        rL = pL.add_run("SEBELUM"); rL.bold=True; rL.font.size=Pt(11)
+        rL = pL.add_run("Sebelum"); rL.bold=True; rL.font.size=Pt(11)
         pR = tbl.cell(1,1).paragraphs[0]; pR.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        rR = pR.add_run("SELEPAS"); rR.bold=True; rR.font.size=Pt(11)
+        rR = pR.add_run("Selepas"); rR.bold=True; rR.font.size=Pt(11)
         doc.add_paragraph().paragraph_format.space_after = Pt(6)
 
-    add_header(os.getenv("COMPANY","HW UNGGUL (901587-V)"), os.getenv("ZONE","ZONE"))
-    add_title(os.getenv("TITLE","1. Grass Cutting"))
+    add_header(company, zone)
+    add_title(title)
     per_page = 4
     for i in range(min(per_page, len(pairs))):
+        if should_cancel():
+            raise CancelledJob("Cancelled by user")
         add_pair_table(pairs[i][0], pairs[i][1])
     if len(pairs) > per_page:
         idx = per_page; pages = 1
         while idx < len(pairs):
+            if should_cancel():
+                raise CancelledJob("Cancelled by user")
             doc.add_page_break()
-            add_header(os.getenv("COMPANY","HW UNGGUL (901587-V)"), os.getenv("ZONE","ZONE"))
+            add_header(company, zone)
             for k in range(per_page):
                 j = idx + k
                 if j >= len(pairs): break
+                if should_cancel():
+                    raise CancelledJob("Cancelled by user")
                 add_pair_table(pairs[j][0], pairs[j][1])
             idx += per_page; pages += 1
             progress["pages"] = pages
 
+    if should_cancel():
+        raise CancelledJob("Cancelled by user")
     doc.save(out_path)
     progress.update(state="done", download=str(out_path))
 
@@ -225,6 +299,9 @@ app = Flask(__name__)
 
 job_manager = JobManager()
 queue_manager = QueueManager()
+REQUIRED_JOB_PAYLOAD_FIELDS = ("month", "site", "task", "company", "zone", "title", "threshold")
+RETRYABLE_STATUSES = {"error", "failed", "cancelled"}
+RERUN_STATUSES = {"done"}
 
 def sse_stream(job_id):
     q = job_manager.get_events(job_id)
@@ -238,26 +315,72 @@ def push(job_id):
     if state:
         job_manager.publish(job_id, dict(state))
 
+def create_report_job(payload):
+    month = str(payload["month"]).strip()
+    site = str(payload["site"]).strip()
+    task = str(payload["task"]).strip()
+    company = str(payload["company"]).strip()
+    zone = str(payload["zone"]).strip()
+    title = str(payload["title"]).strip()
+    threshold = float(payload["threshold"])
+    job_id = uuid.uuid4().hex
+    job_payload = dict(payload)
+    job_payload["threshold"] = threshold
+    job_manager.create(
+        job_id,
+        name=f"{month} {site} {task}",
+        payload=job_payload,
+        state={"state":"queued","done":0,"total":0,"matched":0,"unmatched":0,"before":0,"after":0,"pages":0},
+    )
+    queue_manager.submit(run_job, job_id, month, site, task, company, zone, title, threshold)
+    return job_id
+
+def clean_saved_payload(job):
+    payload = dict((job or {}).get("payload") or {})
+    payload.pop("_state", None)
+    return payload
+
+def validate_report_payload(payload):
+    missing = [field for field in REQUIRED_JOB_PAYLOAD_FIELDS if payload.get(field) in (None, "")]
+    if missing:
+        return f"Missing saved job payload fields: {', '.join(missing)}"
+    try:
+        float(payload["threshold"])
+    except (TypeError, ValueError):
+        return "Invalid saved job threshold"
+    return None
+
 def run_job(job_id, month, site, task, company, zone, title, threshold):
     try:
         job = job_manager.get_state(job_id)
+        if job_manager.is_cancelled(job_id):
+            raise CancelledJob("Cancelled by user")
         job.update(state="starting", done=0, total=0)
+        notify_telegram(f"Report job started: {month} {site} {task}")
         push(job_id)
         input_root = DATA_ROOT / month / site / task
-        out_name = f"{month}_{site}_{task}.docx"
+        legacy_name = "drainage" if task == "drainage_cleaning" else task
+        out_name = f"{month}_{site}_{legacy_name}.docx"
         out_path = REPORT_ROOT / out_name
-        build_report(input_root, out_path, company, zone, title, threshold, job)
+        build_report(input_root, out_path, company, zone, title, threshold, job, lambda: job_manager.is_cancelled(job_id))
+        notify_telegram(f"Report job completed: {out_name}")
+        push(job_id)
+    except CancelledJob:
+        job = job_manager.get_state(job_id)
+        if job:
+            job.update(state="cancelled", error="Cancelled by user", download=None)
         push(job_id)
     except Exception as e:
         job = job_manager.get_state(job_id)
         if job:
             job.update(state="error", error=str(e))
+        notify_telegram(f"Report job failed: {month} {site} {task}\n{e}")
         push(job_id)
 
 @app.route("/")
 def index():
     ms = scan_months_sites()
-    return render_template("index.html", months_sites=ms, tasks=project_manager.list_tasks())
+    return render_template("index.html", months_sites=ms, tasks=report_tasks(), defaults=report_defaults())
 
 @app.get("/settings")
 def settings():
@@ -313,24 +436,17 @@ def start():
     data = request.form
     month = data.get("month","").strip()
     site  = data.get("site","").strip()
-    default_task = (project_manager.list_tasks() or [{"slug": ""}])[0]["slug"]
-    task  = data.get("task", default_task).strip()
-    company = data.get("company","HW UNGGUL (901587-V)").strip()
+    defaults = report_defaults()
+    task  = data.get("task", defaults["task"]).strip()
+    company = data.get("company", defaults["company"]).strip()
     zone    = data.get("zone", f"{site} ZONE").strip()
     task_row = project_manager.task_by_slug(task)
-    title   = data.get("title", (task_row or {}).get("title") or task.replace("_", " ").title()).strip()
-    threshold = float(data.get("threshold","0.70"))
+    title   = data.get("title", (task_row or {}).get("title") or defaults["title"]).strip()
+    threshold = float(data.get("threshold", defaults["threshold"]))
     if not month or not site:
         return jsonify({"ok": False, "error": "Please choose a month and a site"}), 400
-    job_id = uuid.uuid4().hex
     payload = {"month": month, "site": site, "task": task, "company": company, "zone": zone, "title": title, "threshold": threshold}
-    job_manager.create(
-        job_id,
-        name=f"{month} {site} {task}",
-        payload=payload,
-        state={"state":"queued","done":0,"total":0,"matched":0,"unmatched":0,"before":0,"after":0,"pages":0},
-    )
-    queue_manager.submit(run_job, job_id, month, site, task, company, zone, title, threshold)
+    job_id = create_report_job(payload)
     return jsonify({"ok": True, "job_id": job_id})
 
 @app.get("/progress/<job_id>")
@@ -339,10 +455,88 @@ def progress(job_id):
         return "no such job", 404
     return Response(sse_stream(job_id), mimetype="text/event-stream")
 
+@app.get("/api/jobs")
+def jobs_list():
+    limit = request.args.get("limit", "50")
+    status = request.args.get("status", "").strip()
+    search = request.args.get("search", "").strip()
+    try:
+        jobs = job_manager.list_jobs(int(limit), status=status, search=search)
+    except ValueError:
+        jobs = job_manager.list_jobs(status=status, search=search)
+    return jsonify({"ok": True, "jobs": jobs, "counts": job_manager.job_counts()})
+
+@app.get("/api/jobs/<job_id>")
+def jobs_get(job_id):
+    job = job_manager.get_job(job_id)
+    if not job:
+        return jsonify({"ok": False, "error": "Job not found"}), 404
+    return jsonify({"ok": True, "job": job})
+
+@app.post("/api/jobs/<job_id>/retry")
+def jobs_retry(job_id):
+    job = job_manager.get_job(job_id)
+    if not job:
+        return jsonify({"ok": False, "error": "Job not found"}), 404
+
+    status = (job.get("status") or "").lower()
+    if status not in RETRYABLE_STATUSES and status not in RERUN_STATUSES:
+        return jsonify({"ok": False, "error": "Only failed, cancelled, or done jobs can be retried"}), 400
+
+    payload = clean_saved_payload(job)
+    error = validate_report_payload(payload)
+    if error:
+        return jsonify({"ok": False, "error": error}), 400
+
+    mode = "duplicate" if status in RERUN_STATUSES else "retry"
+    payload["duplicate_of" if mode == "duplicate" else "retry_of"] = job_id
+    new_job_id = create_report_job(payload)
+    return jsonify({"ok": True, "job_id": new_job_id, "mode": mode})
+
+@app.post("/api/jobs/<job_id>/cancel")
+def jobs_cancel(job_id):
+    job = job_manager.get_job(job_id)
+    if not job:
+        return jsonify({"ok": False, "error": "Job not found"}), 404
+    status = (job.get("status") or "").lower()
+    if status not in {"queued", "starting", "preprocess", "matching", "running"}:
+        return jsonify({"ok": False, "error": "Only running or queued jobs can be cancelled"}), 400
+    job_manager.cancel(job_id)
+    notify_telegram(f"Report job cancelled: {job.get('name') or job_id}")
+    return jsonify({"ok": True, "job_id": job_id, "status": "cancelled"})
+
+@app.get("/api/folders/scan")
+def folders_scan():
+    months_sites = scan_months_sites()
+    return jsonify(
+        {
+            "ok": True,
+            "months_sites": months_sites,
+            "counts": {
+                "months": len(months_sites),
+                "sites": sum(len(sites) for sites in months_sites.values()),
+            },
+        }
+    )
+
 @app.get("/download")
 def download():
     path = request.args.get("path")
     if not path or not storage.exists(Path(path)):
+        return "Not found", 404
+    return send_file(path, as_attachment=True)
+
+@app.get("/download/job/<job_id>")
+def download_job(job_id):
+    job = job_manager.get_job(job_id)
+    if not job or not job.get("result_path"):
+        return "Not found", 404
+    path = Path(job["result_path"]).resolve()
+    try:
+        path.relative_to(REPORT_ROOT.resolve())
+    except ValueError:
+        return "Not found", 404
+    if not path.exists() or not path.is_file():
         return "Not found", 404
     return send_file(path, as_attachment=True)
 

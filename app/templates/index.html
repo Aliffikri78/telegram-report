@@ -1,157 +1,480 @@
 <!doctype html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8"/>
-  <title>Telegram Report Builder</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Telegram Report - Web UI</title>
   <style>
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:24px;max-width:900px}
-    .card{border:1px solid #ddd;border-radius:12px;padding:18px;margin-bottom:16px;box-shadow:0 1px 4px rgba(0,0,0,.05)}
-    .row{display:flex;gap:16px;flex-wrap:wrap}
-    .col{flex:1 1 280px}
-    .btn{background:#0d6efd;color:white;border:none;border-radius:8px;padding:10px 14px;cursor:pointer}
-    .btn:disabled{opacity:.5;cursor:not-allowed}
-    .progress{height:16px;background:#eee;border-radius:8px;overflow:hidden}
-    .bar{height:100%;background:#0d6efd;width:0%}
-    label{display:block;margin-bottom:6px;font-weight:600}
-    select,input{width:100%;padding:8px;border:1px solid #ccc;border-radius:8px}
-    small{color:#666}
-    code{background:#f6f6f6;padding:2px 6px;border-radius:6px}
+    :root{color-scheme:light;--bg:#f9fafb;--panel:#fff;--text:#111827;--muted:#4b5563;--border:#e5e7eb;--blue:#2563eb;--blue-dark:#1d4ed8;--gray:#374151;--green:#16a34a;--amber:#f59e0b}
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
+    .wrap{max-width:1024px;margin:0 auto;padding:24px}
+    header{margin-bottom:24px}
+    h1{font-size:30px;line-height:1.2;margin:0;font-weight:600}
+    h2{font-size:18px;margin:0 0 12px;font-weight:500}
+    .topline{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
+    .settings{font-size:14px;color:#1d4ed8;text-decoration:underline}
+    .grid{display:grid;grid-template-columns:minmax(0,2fr) minmax(260px,1fr);gap:24px}
+    .stack{display:flex;flex-direction:column;gap:16px}
+    .card{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:16px;box-shadow:0 1px 2px rgba(0,0,0,.05)}
+    .fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+    .fields.three{grid-template-columns:repeat(3,minmax(0,1fr))}
+    label{display:block}
+    label span{display:block;font-size:14px;margin-bottom:4px;color:#1f2937}
+    select,input{width:100%;border:1px solid #d1d5db;border-radius:8px;padding:8px;background:#fff;color:var(--text);font:inherit}
+    select:focus,input:focus{outline:2px solid rgba(37,99,235,.25);border-color:var(--blue)}
+    button,.button{display:inline-block;border:0;border-radius:12px;padding:10px 14px;font:inherit;text-align:center;text-decoration:none;cursor:pointer}
+    button:disabled{opacity:.5;cursor:not-allowed}
+    .primary{width:100%;background:var(--blue);color:#fff}
+    .primary:hover{background:var(--blue-dark)}
+    .secondary{width:100%;background:var(--gray);color:#fff;margin-top:8px}
+    .download{margin-top:12px;color:#1d4ed8;text-decoration:underline}
+    .status-text{font-size:14px;color:var(--muted);margin:8px 0 0;min-height:20px}
+    .status-row{display:flex;align-items:center;gap:8px;font-size:14px}
+    .dot{width:12px;height:12px;border-radius:50%;background:var(--green);display:inline-block}
+    .dot.running{background:var(--amber)}
+    .progress{height:16px;background:#e5e7eb;border-radius:999px;overflow:hidden;margin-top:12px}
+    .bar{height:100%;background:var(--blue);width:0%;transition:width .2s ease}
+    .stats{font-size:14px;color:var(--muted);margin-top:8px;line-height:1.6}
+    .history{margin-top:24px}
+    .history-head{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px}
+    .history-controls{display:flex;align-items:end;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+    .history-controls label{min-width:150px}
+    .history-controls input[type="checkbox"]{width:auto;margin-right:6px}
+    .mini-btn{background:#374151;color:#fff;border-radius:8px;padding:8px 12px}
+    .counts{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:12px}
+    .count{border:1px solid var(--border);border-radius:10px;padding:10px;background:#fff}
+    .count span{display:block;font-size:12px;color:var(--muted)}
+    .count strong{display:block;font-size:22px;line-height:1.2;margin-top:2px}
+    .history-wrap{overflow:auto}
+    table{width:100%;border-collapse:collapse;font-size:14px}
+    th,td{border-bottom:1px solid var(--border);padding:8px;text-align:left;vertical-align:top}
+    th{font-weight:600;color:#1f2937;background:#f9fafb}
+    .status-pill{display:inline-block;border-radius:999px;padding:2px 8px;background:#f3f4f6;color:#374151}
+    .status-pill.done{background:#dcfce7;color:#166534}
+    .status-pill.error{background:#fee2e2;color:#991b1b}
+    .status-pill.cancelled{background:#e5e7eb;color:#374151}
+    .status-pill.running,.status-pill.matching,.status-pill.preprocess,.status-pill.starting,.status-pill.queued{background:#fef3c7;color:#92400e}
+    code{background:#f3f4f6;padding:2px 6px;border-radius:6px;color:#111827}
+    @media (max-width:800px){
+      .grid{grid-template-columns:1fr}
+      .fields,.fields.three{grid-template-columns:1fr}
+      .counts{grid-template-columns:repeat(2,minmax(0,1fr))}
+    }
   </style>
 </head>
 <body>
-  <h2>Telegram Report Builder</h2>
-  <p><a href="/settings">Settings</a></p>
-  <div class="card">
-    <form id="form">
-      <div class="row">
-        <div class="col">
-          <label>Month</label>
-          <select name="month" id="month">
-            {% for m, sites in months_sites.items() %}
-            <option value="{{m}}">{{m}}</option>
-            {% endfor %}
-          </select>
-        </div>
-        <div class="col">
-          <label>Site</label>
-          <select name="site" id="site"></select>
-          <small id="siteHelp"></small>
-        </div>
-        <div class="col">
-          <label>Task</label>
-          <select name="task" id="task">
-            {% for task in tasks %}
-            <option value="{{task.slug}}" data-title="{{task.title or task.name}}">{{task.name}}</option>
-            {% endfor %}
-          </select>
-        </div>
-      </div>
+  <div class="wrap">
+    <header class="topline">
+      <h1>Telegram Report - Web UI</h1>
+      <a class="settings" href="/settings">Settings</a>
+    </header>
 
-      <div class="row" style="margin-top:12px">
-        <div class="col">
-          <label>Company</label>
-          <input name="company" value="HW UNGGUL (901587-V)">
-        </div>
-        <div class="col">
-          <label>Zone</label>
-          <input name="zone" id="zone" value="ZONE">
-        </div>
-        <div class="col">
-          <label>Section title</label>
-          <input name="title" id="title" value="1. Grass Cutting">
-        </div>
-        <div class="col">
-          <label>Match threshold</label>
-          <input name="threshold" type="number" step="0.01" min="0.5" max="0.95" value="0.70">
-        </div>
-      </div>
+    <div class="grid">
+      <main class="stack">
+        <section class="card">
+          <div class="history-head">
+            <h2>1) Source</h2>
+            <button class="mini-btn" id="refreshFolders" type="button">Refresh folders</button>
+          </div>
+          <div class="fields">
+            <label><span>Month</span>
+              <select name="month" id="month">
+                <option value="" disabled>Select month</option>
+                {% for m, sites in months_sites.items() %}
+                <option value="{{m}}">{{m}}</option>
+                {% endfor %}
+              </select>
+            </label>
+            <label><span>Site</span>
+              <select name="site" id="site">
+                <option value="" disabled>Select site</option>
+              </select>
+            </label>
+          </div>
+          <p class="status-text" id="folderStatus"></p>
+        </section>
 
-      <div class="row" style="margin-top:16px">
-        <button class="btn" id="runBtn" type="submit">Run Report</button>
-      </div>
-    </form>
-  </div>
+        <section class="card">
+          <h2>2) Task & Layout</h2>
+          <form id="form">
+            <div class="fields three">
+              <label><span>Task</span>
+                <select name="task" id="task">
+                  {% for task in tasks %}
+                  <option value="{{task.slug}}" data-title="{{task.title or task.name}}" {% if task.slug == defaults.task %}selected{% endif %}>{{task.name}}</option>
+                  {% endfor %}
+                </select>
+              </label>
+              <label><span>Company</span>
+                <input name="company" value="{{defaults.company}}" placeholder="HW UNGGUL (901587-V)">
+              </label>
+              <label><span>Zone</span>
+                <input name="zone" id="zone" value="{{defaults.zone}}">
+              </label>
+            </div>
+            <div class="fields" style="margin-top:12px">
+              <label><span>Section title</span>
+                <input name="title" id="title" value="{{defaults.title}}">
+              </label>
+              <label><span>Match threshold</span>
+                <input name="threshold" type="number" step="0.01" min="0.5" max="0.95" value="{{defaults.threshold}}">
+              </label>
+            </div>
+          </form>
+        </section>
+      </main>
 
-  <div class="card" id="statusCard" style="display:none">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-      <div><strong>Status:</strong> <span id="state">-</span></div>
-      <div><a id="downloadLink" href="#" style="display:none" class="btn">Download DOCX</a></div>
+      <aside class="stack">
+        <section class="card">
+          <h2>Actions</h2>
+          <button class="primary" id="runBtn" type="submit" form="form">Generate Report</button>
+          <p class="status-text" id="message"></p>
+          <a id="downloadLink" href="#" class="download" style="display:none">Download latest report</a>
+        </section>
+
+        <section class="card">
+          <h2>Status</h2>
+          <div class="status-row">
+            <span class="dot" id="dot"></span>
+            <span id="state">Idle</span>
+          </div>
+          <div class="progress"><div class="bar" id="bar"></div></div>
+          <div class="stats" id="stats"></div>
+        </section>
+      </aside>
     </div>
-    <div class="progress"><div class="bar" id="bar"></div></div>
-    <div style="margin-top:8px" id="stats"></div>
+
+    <section class="card history">
+      <div class="history-head">
+        <h2>Job History</h2>
+        <button class="mini-btn" id="refreshJobs" type="button">Refresh</button>
+      </div>
+      <div class="counts">
+        <div class="count"><span>Total</span><strong id="countTotal">0</strong></div>
+        <div class="count"><span>Running</span><strong id="countRunning">0</strong></div>
+        <div class="count"><span>Done</span><strong id="countDone">0</strong></div>
+        <div class="count"><span>Failed</span><strong id="countFailed">0</strong></div>
+      </div>
+      <div class="history-controls">
+        <label><span>Status</span>
+          <select id="jobStatus">
+            <option value="all">All</option>
+            <option value="running">Running</option>
+            <option value="done">Done</option>
+            <option value="failed">Failed</option>
+          </select>
+        </label>
+        <label><span>Search</span>
+          <input id="jobSearch" type="search" placeholder="Month, site, task, error">
+        </label>
+        <label><span>&nbsp;</span>
+          <span><input id="autoRefreshJobs" type="checkbox" checked>Auto-refresh</span>
+        </label>
+      </div>
+      <div class="history-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Created</th>
+              <th>Job</th>
+              <th>Status</th>
+              <th>Matched</th>
+              <th>Fallback</th>
+              <th>Error</th>
+              <th>Report</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody id="jobRows">
+            <tr><td colspan="8">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
   </div>
 
 <script>
-const monthsSites = {{ months_sites|tojson }};
+let monthsSites = {{ months_sites|tojson }};
 const monthSel = document.getElementById('month');
 const siteSel = document.getElementById('site');
+const refreshFolders = document.getElementById('refreshFolders');
+const folderStatus = document.getElementById('folderStatus');
 const zoneInp = document.getElementById('zone');
 const taskSel = document.getElementById('task');
 const titleInp = document.getElementById('title');
-
-function refreshSites(){
-  const m = monthSel.value;
-  const sites = monthsSites[m] || [];
-  siteSel.innerHTML = sites.map(s => `<option value="${s}">${s}</option>`).join('');
-  zoneInp.value = (siteSel.value || 'SITE') + " ZONE";
-}
-monthSel.addEventListener('change', refreshSites);
-taskSel.addEventListener('change', ()=>{
-  const selected = taskSel.options[taskSel.selectedIndex];
-  titleInp.value = selected?.dataset?.title || selected?.textContent || '';
-});
-refreshSites();
-
 const form = document.getElementById('form');
-const statusCard = document.getElementById('statusCard');
 const stateSpan = document.getElementById('state');
+const dot = document.getElementById('dot');
 const bar = document.getElementById('bar');
 const stats = document.getElementById('stats');
 const runBtn = document.getElementById('runBtn');
 const downloadLink = document.getElementById('downloadLink');
+const message = document.getElementById('message');
+const jobRows = document.getElementById('jobRows');
+const refreshJobs = document.getElementById('refreshJobs');
+const jobStatus = document.getElementById('jobStatus');
+const jobSearch = document.getElementById('jobSearch');
+const autoRefreshJobs = document.getElementById('autoRefreshJobs');
+const countTotal = document.getElementById('countTotal');
+const countRunning = document.getElementById('countRunning');
+const countDone = document.getElementById('countDone');
+const countFailed = document.getElementById('countFailed');
+let jobRefreshTimer = null;
+let jobSearchTimer = null;
+
+function refreshSites(){
+  const m = monthSel.value;
+  const sites = monthsSites[m] || [];
+  const current = siteSel.value;
+  siteSel.innerHTML = '<option value="" disabled>Select site</option>' + sites.map(s => `<option value="${s}">${s}</option>`).join('');
+  siteSel.value = sites.includes(current) ? current : (sites[0] || '');
+  refreshZone();
+}
+
+function refreshMonths(){
+  const current = monthSel.value;
+  const months = Object.keys(monthsSites);
+  monthSel.innerHTML = '<option value="" disabled>Select month</option>' + months.map(m => `<option value="${m}">${m}</option>`).join('');
+  monthSel.value = months.includes(current) ? current : (months[0] || '');
+  refreshSites();
+}
+
+function refreshZone(){
+  zoneInp.value = (siteSel.value || 'SITE') + ' ZONE';
+}
+
+function refreshTitle(){
+  const selected = taskSel.options[taskSel.selectedIndex];
+  titleInp.value = selected?.dataset?.title || selected?.textContent || '';
+}
+
+function setRunning(running){
+  runBtn.disabled = running;
+  dot.classList.toggle('running', running);
+}
+
+function escapeHtml(value){
+  return String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+}
+
+function jobStat(job, key){
+  return job?.payload?._state?.[key] ?? '';
+}
+
+function canRetryJob(job){
+  return ['error', 'failed', 'cancelled', 'done'].includes(String(job.status || '').toLowerCase());
+}
+
+function retryLabel(job){
+  return String(job.status || '').toLowerCase() === 'done' ? 'Rerun' : 'Retry';
+}
+
+function canCancelJob(job){
+  return ['queued', 'starting', 'preprocess', 'matching', 'running'].includes(String(job.status || '').toLowerCase());
+}
+
+async function retryJob(jobId, label){
+  const prompt = label === 'Rerun' ? 'Rerun this completed report?' : 'Retry this failed job?';
+  if(!confirm(prompt)) return;
+  const r = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/retry`, {method:'POST'});
+  const d = await r.json();
+  if(!d.ok){
+    message.textContent = d.error || 'Could not start retry';
+    return;
+  }
+  message.textContent = d.mode === 'duplicate' ? 'Rerun started.' : 'Retry started.';
+  loadJobs();
+  followJob(d.job_id);
+}
+
+async function cancelJob(jobId){
+  if(!confirm('Cancel this running job?')) return;
+  const r = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, {method:'POST'});
+  const d = await r.json();
+  if(!d.ok){
+    message.textContent = d.error || 'Could not cancel job';
+    return;
+  }
+  message.textContent = 'Cancelled by user';
+  stateSpan.textContent = 'cancelled';
+  downloadLink.style.display = 'none';
+  setRunning(false);
+  loadJobs();
+}
+
+async function scanFolders(){
+  try{
+    const r = await fetch('/api/folders/scan');
+    const d = await r.json();
+    if(!d.ok){
+      folderStatus.textContent = 'Could not refresh folders.';
+      return;
+    }
+    monthsSites = d.months_sites || {};
+    refreshMonths();
+    folderStatus.textContent = `Detected ${d.counts?.months || 0} months and ${d.counts?.sites || 0} sites.`;
+  }catch(e){
+    folderStatus.textContent = 'Could not refresh folders.';
+  }
+}
+
+function updateCounts(counts){
+  countTotal.textContent = counts?.total ?? 0;
+  countRunning.textContent = counts?.running ?? 0;
+  countDone.textContent = counts?.done ?? 0;
+  countFailed.textContent = counts?.failed ?? 0;
+}
+
+async function loadJobs(){
+  try{
+    const params = new URLSearchParams({limit: '25'});
+    if(jobStatus.value && jobStatus.value !== 'all') params.set('status', jobStatus.value);
+    if(jobSearch.value.trim()) params.set('search', jobSearch.value.trim());
+    const r = await fetch('/api/jobs?' + params.toString());
+    const d = await r.json();
+    updateCounts(d.counts);
+    if(!d.ok || !d.jobs.length){
+      jobRows.innerHTML = '<tr><td colspan="8">No jobs yet.</td></tr>';
+      return;
+    }
+    jobRows.innerHTML = d.jobs.map(job => {
+      const status = escapeHtml(job.status || '-');
+      const download = job.result_path && job.status === 'done'
+        ? `<a href="/download/job/${encodeURIComponent(job.id)}">Download</a>`
+        : '';
+      const label = retryLabel(job);
+      const action = canRetryJob(job)
+        ? `<button class="mini-btn" type="button" data-retry-job="${escapeHtml(job.id)}" data-retry-label="${label}">${label}</button>`
+        : (canCancelJob(job) ? `<button class="mini-btn" type="button" data-cancel-job="${escapeHtml(job.id)}">Cancel</button>` : '');
+      return `
+        <tr>
+          <td>${escapeHtml(job.created_at || '')}</td>
+          <td>${escapeHtml(job.name || job.id)}</td>
+          <td><span class="status-pill ${status}">${status}</span></td>
+          <td>${escapeHtml(jobStat(job, 'matched'))}</td>
+          <td>${escapeHtml(jobStat(job, 'unmatched'))}</td>
+          <td>${escapeHtml(job.error || '')}</td>
+          <td>${download}</td>
+          <td>${action}</td>
+        </tr>
+      `;
+    }).join('');
+  }catch(e){
+    jobRows.innerHTML = '<tr><td colspan="8">Could not load job history.</td></tr>';
+  }
+}
+
+function followJob(jobId){
+  setRunning(true);
+  stateSpan.textContent = 'Starting...';
+  message.textContent = 'Running...';
+  bar.style.width = '0%';
+  stats.textContent = '';
+  downloadLink.style.display = 'none';
+  downloadLink.removeAttribute('href');
+
+  const es = new EventSource(`/progress/${jobId}`);
+  es.onmessage = (ev)=>{
+    const d = JSON.parse(ev.data);
+    stateSpan.textContent = d.state || '-';
+    const total = d.total || d.before || 0;
+    const done = d.done || 0;
+    const pct = total > 0 ? Math.round(100 * done / total) : (d.state === 'done' ? 100 : 0);
+    bar.style.width = pct + '%';
+    stats.innerHTML = `Before: <code>${d.before || 0}</code> &nbsp; After: <code>${d.after || 0}</code><br>Matched: <code>${d.matched || 0}</code> &nbsp; Fallback: <code>${d.unmatched || 0}</code> &nbsp; Pages: <code>${d.pages || 1}</code>`;
+
+    if(d.state === 'done' && d.download){
+      downloadLink.href = '/download?path=' + encodeURIComponent(d.download);
+      downloadLink.style.display = '';
+      message.textContent = 'Report ready.';
+      es.close();
+      setRunning(false);
+      loadJobs();
+    }
+    if(d.state === 'error'){
+      message.textContent = 'Error: ' + (d.error || '');
+      es.close();
+      setRunning(false);
+      loadJobs();
+    }
+    if(d.state === 'cancelled'){
+      message.textContent = 'Cancelled by user';
+      downloadLink.style.display = 'none';
+      es.close();
+      setRunning(false);
+      loadJobs();
+    }
+  };
+}
+
+function setJobAutoRefresh(enabled){
+  if(jobRefreshTimer){
+    clearInterval(jobRefreshTimer);
+    jobRefreshTimer = null;
+  }
+  if(enabled){
+    jobRefreshTimer = setInterval(loadJobs, 5000);
+  }
+}
+
+monthSel.addEventListener('change', refreshSites);
+refreshFolders.addEventListener('click', scanFolders);
+siteSel.addEventListener('change', refreshZone);
+taskSel.addEventListener('change', refreshTitle);
+refreshJobs.addEventListener('click', loadJobs);
+jobStatus.addEventListener('change', loadJobs);
+jobSearch.addEventListener('input', ()=>{
+  clearTimeout(jobSearchTimer);
+  jobSearchTimer = setTimeout(loadJobs, 300);
+});
+autoRefreshJobs.addEventListener('change', ()=>{
+  setJobAutoRefresh(autoRefreshJobs.checked);
+});
+jobRows.addEventListener('click', (event)=>{
+  const button = event.target.closest('[data-retry-job]');
+  if(button){
+    retryJob(button.dataset.retryJob, button.dataset.retryLabel);
+  }
+  const cancelButton = event.target.closest('[data-cancel-job]');
+  if(cancelButton){
+    cancelJob(cancelButton.dataset.cancelJob);
+  }
+});
+refreshMonths();
+refreshTitle();
+loadJobs();
+setJobAutoRefresh(autoRefreshJobs.checked);
 
 form.addEventListener('submit', async (e)=>{
   e.preventDefault();
-  runBtn.disabled = true;
-  stateSpan.textContent = 'starting...';
-  statusCard.style.display = '';
+  if(!monthSel.value || !siteSel.value){
+    message.textContent = 'Please choose a month and site.';
+    return;
+  }
+
+  setRunning(true);
+  stateSpan.textContent = 'Starting...';
+  message.textContent = 'Starting...';
   bar.style.width = '0%';
   stats.textContent = '';
   downloadLink.style.display = 'none';
   downloadLink.removeAttribute('href');
 
   const formData = new FormData(form);
+  formData.set('month', monthSel.value);
+  formData.set('site', siteSel.value);
+
   const r = await fetch('/start', {method:'POST', body: formData});
   const j = await r.json();
-  if(!j.ok){ alert(j.error || 'Failed'); runBtn.disabled = false; return; }
-  const job = j.job_id;
+  if(!j.ok){
+    message.textContent = j.error || 'Failed to start';
+    stateSpan.textContent = 'Idle';
+    setRunning(false);
+    return;
+  }
 
-  const es = new EventSource(`/progress/${job}`);
-  es.onmessage = (ev)=>{
-    const d = JSON.parse(ev.data);
-    stateSpan.textContent = d.state || '-';
-    const total = d.total || d.before || 0;
-    const done = d.done || 0;
-    const pct = total>0 ? Math.round(100*done/total) : (d.state==='done'?100:0);
-    bar.style.width = pct + '%';
-
-    stats.innerHTML = `
-      <div>Before: <code>${d.before||0}</code> · After: <code>${d.after||0}</code> · Matched: <code>${d.matched||0}</code> · Fallback: <code>${d.unmatched||0}</code> · Pages: <code>${d.pages||1}</code></div>
-    `;
-
-    if(d.state === 'done' && d.download){
-      downloadLink.href = '/download?path=' + encodeURIComponent(d.download);
-      downloadLink.style.display = '';
-      es.close();
-      runBtn.disabled = false;
-    }
-    if(d.state === 'error'){
-      alert('Error: ' + (d.error||''));
-      es.close();
-      runBtn.disabled = false;
-    }
-  };
+  followJob(j.job_id);
 });
 </script>
 </body>

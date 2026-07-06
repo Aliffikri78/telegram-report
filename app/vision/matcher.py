@@ -8,6 +8,11 @@ import imagehash
 import numpy as np
 from PIL import Image
 
+try:
+    from vision.feature_cache import FeatureCache
+except ImportError:
+    from app.vision.feature_cache import FeatureCache
+
 
 MAX_SIDE = int(os.getenv("FAST_MAX_SIDE", "1600"))
 NFEATURES = int(os.getenv("FAST_NFEATURES", "600"))
@@ -71,6 +76,52 @@ def imread_gray_resized(path: Path):
 def phash(path: Path) -> int:
     with Image.open(path) as im:
         return int(str(imagehash.phash(im.convert("RGB"))), 16)
+
+
+def serialize_keypoints(keypoints) -> List[Tuple[float, float, float, float, float, int, int]]:
+    return [
+        (kp.pt[0], kp.pt[1], kp.size, kp.angle, kp.response, kp.octave, kp.class_id)
+        for kp in (keypoints or [])
+    ]
+
+
+def deserialize_keypoints(items) -> List:
+    keypoints = []
+    for x, y, size, angle, response, octave, class_id in items or []:
+        keypoints.append(
+            cv2.KeyPoint(float(x), float(y), float(size), float(angle), float(response), int(octave), int(class_id))
+        )
+    return keypoints
+
+
+def compute_features(path: Path, orb, cache: FeatureCache):
+    gray = imread_gray_resized(path)
+    cached = cache.get(path, MAX_SIDE, NFEATURES) if cache else None
+    if cached:
+        try:
+            return (
+                cached["phash"],
+                gray,
+                deserialize_keypoints(cached.get("keypoints")),
+                cached.get("descriptors"),
+            )
+        except Exception:
+            pass
+
+    image_hash = phash(path)
+    keypoints, descriptors = orb.detectAndCompute(gray, None) if gray is not None else (None, None)
+    if cache:
+        cache.set(
+            path,
+            MAX_SIDE,
+            NFEATURES,
+            {
+                "phash": image_hash,
+                "keypoints": serialize_keypoints(keypoints),
+                "descriptors": descriptors,
+            },
+        )
+    return image_hash, gray, keypoints or [], descriptors
 
 
 def hamming(a: int, b: int) -> int:
@@ -621,6 +672,7 @@ def match_pairs(
     backend: str = "cpu",
 ) -> List[Pair]:
     match_start = time.perf_counter()
+    feature_cache = FeatureCache()
     candidate_comparisons = 0
     threshold = max(0.50, float(threshold or 0.0))
     backend_requested, backend_used, backend_note = resolve_backend(backend)
@@ -639,9 +691,8 @@ def match_pairs(
     for p in befores:
         if should_cancel():
             raise cancelled_exception("Cancelled by user")
-        be_ph.append(phash(p))
-        arr = imread_gray_resized(p)
-        k, d = orb.detectAndCompute(arr, None) if arr is not None else (None, None)
+        image_hash, arr, k, d = compute_features(p, orb, feature_cache)
+        be_ph.append(image_hash)
         be_gray[p] = arr
         be_kp[p] = k or []
         be_desc[p] = d
@@ -649,9 +700,8 @@ def match_pairs(
     for p in afters:
         if should_cancel():
             raise cancelled_exception("Cancelled by user")
-        af_ph.append(phash(p))
-        arr = imread_gray_resized(p)
-        k, d = orb.detectAndCompute(arr, None) if arr is not None else (None, None)
+        image_hash, arr, k, d = compute_features(p, orb, feature_cache)
+        af_ph.append(image_hash)
         af_gray[p] = arr
         af_kp[p] = k or []
         af_desc[p] = d
@@ -668,6 +718,9 @@ def match_pairs(
         images_per_sec=0.0,
         candidate_comparisons=0,
         cache_hits=0,
+        feature_cache_hits=feature_cache.cache_hits,
+        feature_cache_misses=feature_cache.cache_misses,
+        feature_cache_path=str(feature_cache.path),
         average_confidence=0.0,
         lowest_confidence=0.0,
         highest_confidence=0.0,
@@ -692,6 +745,7 @@ def match_pairs(
                 af_desc,
                 be_gray,
                 af_gray,
+                threshold,
                 progress,
                 should_cancel,
                 cancelled_exception,
@@ -834,5 +888,10 @@ def match_pairs(
         progress["hungarian_accepted"] = 0
 
     update_matching_metrics(progress, match_start, total_images, candidate_comparisons)
+    progress["cache_hits"] = feature_cache.cache_hits
+    progress["feature_cache_hits"] = feature_cache.cache_hits
+    progress["feature_cache_misses"] = feature_cache.cache_misses
+    progress["feature_cache_path"] = str(feature_cache.path)
+    feature_cache.save()
 
     return pairs

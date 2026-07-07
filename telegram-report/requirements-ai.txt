@@ -1,0 +1,6 @@
+timm
+kornia
+pillow
+numpy
+scipy
+opencv-python-headless

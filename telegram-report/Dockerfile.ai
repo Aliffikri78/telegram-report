@@ -18,4 +18,6 @@ RUN python -m pip install --no-cache-dir --upgrade pip \
 
 COPY telegram-report/app /app/app
 
-CMD ["python", "/app/app/vision/ai_smoke_test.py"]
+EXPOSE 8090
+
+CMD ["python", "/app/app/vision/ai_service.py"]

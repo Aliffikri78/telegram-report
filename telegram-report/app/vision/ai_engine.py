@@ -1,6 +1,13 @@
 _torch = None
 _model = None
 _model_error = None
+PAIR_MATCH_IMPLEMENTED = True
+REPORT_MATCH_IMPLEMENTED = False
+
+try:
+    from vision import lightglue_matcher
+except ImportError:
+    from app.vision import lightglue_matcher
 
 
 def _import_torch():
@@ -40,6 +47,7 @@ def status():
         except Exception:
             cuda_available = False
             gpu_name = None
+    lightglue_status = lightglue_matcher.status()
     return {
         "torch_available": torch_available,
         "torch_version": torch_version,
@@ -49,16 +57,23 @@ def status():
         "gpu_name": gpu_name,
         "total_gpu_memory_mb": total_gpu_memory_mb,
         "current_device": current_device,
-        "model_available": False,
-        "model_loaded": _model is not None,
-        "model_error": _model_error,
-        "implemented": False,
+        "model_available": bool(lightglue_status.get("available")),
+        "model_loaded": bool(lightglue_status.get("loaded")),
+        "model_error": lightglue_status.get("error") or _model_error,
+        "implemented": REPORT_MATCH_IMPLEMENTED,
+        "pair_match_implemented": PAIR_MATCH_IMPLEMENTED,
+        "report_match_implemented": REPORT_MATCH_IMPLEMENTED,
     }
 
 
 def is_available():
     info = status()
-    return bool(info["torch_available"] and info["cuda_available"] and info["model_available"] and info["implemented"])
+    return bool(
+        info["torch_available"]
+        and info["cuda_available"]
+        and info["model_available"]
+        and info["report_match_implemented"]
+    )
 
 
 def device_name():
@@ -67,10 +82,26 @@ def device_name():
 
 
 def load_model():
-    global _model_error
-    _model_error = "AI matcher model not implemented yet"
-    return None
+    global _model, _model_error
+    try:
+        _model = lightglue_matcher.load_model()
+        _model_error = None
+        return _model
+    except Exception as exc:
+        _model = None
+        _model_error = str(exc)
+        return None
 
 
-def match(*args, **kwargs):
-    raise RuntimeError("AI matcher not implemented yet")
+def match(before_image, after_image):
+    try:
+        return lightglue_matcher.match(before_image, after_image)
+    except Exception as exc:
+        return {
+            "confidence": 0.0,
+            "matches": 0,
+            "keypoints_before": 0,
+            "keypoints_after": 0,
+            "processing_time_ms": 0.0,
+            "error": str(exc),
+        }

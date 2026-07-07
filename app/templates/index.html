@@ -37,6 +37,8 @@
     .progress{height:16px;background:#e5e7eb;border-radius:999px;overflow:hidden;margin-top:12px}
     .bar{height:100%;background:var(--blue);width:0%;transition:width .2s ease}
     .stats{font-size:14px;color:var(--muted);margin-top:8px;line-height:1.6}
+    details.matching-stats{margin-top:12px}
+    details.matching-stats summary{cursor:pointer;font-size:14px;color:#1f2937}
     .history{margin-top:24px}
     .history-head{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px}
     .history-controls{display:flex;align-items:end;gap:10px;flex-wrap:wrap;margin-bottom:12px}
@@ -125,7 +127,14 @@
                 <select name="backend" id="backend">
                   <option value="cpu" selected>CPU</option>
                   <option value="auto">Auto</option>
+                  <option value="ai">AI</option>
                   <option value="gpu">GPU</option>
+                </select>
+              </label>
+              <label><span>AI pair review</span>
+                <select name="ai_review">
+                  <option value="0" selected>Off</option>
+                  <option value="1">On</option>
                 </select>
               </label>
             </div>
@@ -139,6 +148,7 @@
           <button class="primary" id="runBtn" type="submit" form="form">Generate Report</button>
           <p class="status-text" id="message"></p>
           <a id="downloadLink" href="#" class="download" style="display:none">Download latest report</a>
+          <a id="debugDownloadLink" href="#" class="download" style="display:none">Download debug JSON</a>
         </section>
 
         <section class="card">
@@ -149,6 +159,10 @@
           </div>
           <div class="progress"><div class="bar" id="bar"></div></div>
           <div class="stats" id="stats"></div>
+          <details class="matching-stats">
+            <summary>Matching Statistics</summary>
+            <div class="stats" id="matchingStats"></div>
+          </details>
         </section>
 
         <section class="card">
@@ -234,6 +248,7 @@ const stateSpan = document.getElementById('state');
 const dot = document.getElementById('dot');
 const bar = document.getElementById('bar');
 const stats = document.getElementById('stats');
+const matchingStats = document.getElementById('matchingStats');
 const gpuDot = document.getElementById('gpuDot');
 const gpuState = document.getElementById('gpuState');
 const gpuDetails = document.getElementById('gpuDetails');
@@ -242,6 +257,7 @@ const visionDistance = document.getElementById('visionDistance');
 const visionSummary = document.getElementById('visionSummary');
 const runBtn = document.getElementById('runBtn');
 const downloadLink = document.getElementById('downloadLink');
+const debugDownloadLink = document.getElementById('debugDownloadLink');
 const message = document.getElementById('message');
 const jobRows = document.getElementById('jobRows');
 const refreshJobs = document.getElementById('refreshJobs');
@@ -294,6 +310,11 @@ function jobStat(job, key){
   return job?.payload?._state?.[key] ?? '';
 }
 
+function fmtMetric(value, suffix=''){
+  const n = Number(value || 0);
+  return `${Number.isFinite(n) ? n : 0}${suffix}`;
+}
+
 function canRetryJob(job){
   return ['error', 'failed', 'cancelled', 'done'].includes(String(job.status || '').toLowerCase());
 }
@@ -331,6 +352,7 @@ async function cancelJob(jobId){
   message.textContent = 'Cancelled by user';
   stateSpan.textContent = 'cancelled';
   downloadLink.style.display = 'none';
+  debugDownloadLink.style.display = 'none';
   setRunning(false);
   loadJobs();
 }
@@ -427,7 +449,7 @@ async function loadJobs(){
     jobRows.innerHTML = d.jobs.map(job => {
       const status = escapeHtml(job.status || '-');
       const download = job.result_path && job.status === 'done'
-        ? `<a href="/download/job/${encodeURIComponent(job.id)}">Download</a>`
+        ? `<a href="/download/job/${encodeURIComponent(job.id)}">Download</a> &nbsp; <a href="/download/debug/${encodeURIComponent(job.id)}">Debug</a>`
         : '';
       const label = retryLabel(job);
       const action = canRetryJob(job)
@@ -457,8 +479,11 @@ function followJob(jobId){
   message.textContent = 'Running...';
   bar.style.width = '0%';
   stats.textContent = '';
+  matchingStats.textContent = '';
   downloadLink.style.display = 'none';
   downloadLink.removeAttribute('href');
+  debugDownloadLink.style.display = 'none';
+  debugDownloadLink.removeAttribute('href');
 
   const es = new EventSource(`/progress/${jobId}`);
   es.onmessage = (ev)=>{
@@ -469,10 +494,24 @@ function followJob(jobId){
     const pct = total > 0 ? Math.round(100 * done / total) : (d.state === 'done' ? 100 : 0);
     bar.style.width = pct + '%';
     stats.innerHTML = `Before: <code>${d.before || 0}</code> &nbsp; After: <code>${d.after || 0}</code><br>Matched: <code>${d.matched || 0}</code> &nbsp; Fallback: <code>${d.unmatched || 0}</code> &nbsp; Pages: <code>${d.pages || 1}</code><br>Backend: <code>${d.backend_used || 'cpu'}</code>${d.backend_note ? ` &nbsp; <span>${escapeHtml(d.backend_note)}</span>` : ''}`;
+    matchingStats.innerHTML = `
+      Backend: <code>${escapeHtml(d.backend_used || 'cpu')}</code><br>
+      Total matching time: <code>${fmtMetric(d.matching_time_sec, 's')}</code><br>
+      Images/sec: <code>${fmtMetric(d.images_per_sec)}</code><br>
+      Matched: <code>${d.matched || 0}</code><br>
+      Fallback: <code>${d.unmatched || 0}</code><br>
+      Average confidence: <code>${fmtMetric(d.average_confidence, '%')}</code><br>
+      Lowest confidence: <code>${fmtMetric(d.lowest_confidence, '%')}</code><br>
+      Highest confidence: <code>${fmtMetric(d.highest_confidence, '%')}</code>
+    `;
 
     if(d.state === 'done' && d.download){
       downloadLink.href = '/download?path=' + encodeURIComponent(d.download);
       downloadLink.style.display = '';
+      if(d.debug_download){
+        debugDownloadLink.href = `/download/debug/${encodeURIComponent(jobId)}`;
+        debugDownloadLink.style.display = '';
+      }
       message.textContent = 'Report ready.';
       es.close();
       setRunning(false);
@@ -487,6 +526,7 @@ function followJob(jobId){
     if(d.state === 'cancelled'){
       message.textContent = 'Cancelled by user';
       downloadLink.style.display = 'none';
+      debugDownloadLink.style.display = 'none';
       es.close();
       setRunning(false);
       loadJobs();
@@ -546,12 +586,16 @@ form.addEventListener('submit', async (e)=>{
   message.textContent = 'Starting...';
   bar.style.width = '0%';
   stats.textContent = '';
+  matchingStats.textContent = '';
   downloadLink.style.display = 'none';
   downloadLink.removeAttribute('href');
+  debugDownloadLink.style.display = 'none';
+  debugDownloadLink.removeAttribute('href');
 
   const formData = new FormData(form);
   formData.set('month', monthSel.value);
   formData.set('site', siteSel.value);
+  formData.set('ai_review', form.querySelector('[name="ai_review"]')?.value || '0');
 
   const r = await fetch('/start', {method:'POST', body: formData});
   const j = await r.json();

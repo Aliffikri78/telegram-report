@@ -1,0 +1,150 @@
+{
+  "report": "/data/reports_dev/2026-07_BRAVO_grass_cutting.docx",
+  "backend_used": "cpu",
+  "backend_requested": "cpu",
+  "processing_time": {
+    "matching_time_sec": 5.786,
+    "avg_time_per_image_sec": 0.321,
+    "images_per_sec": 3.111
+  },
+  "performance": {
+    "candidate_comparisons": 47,
+    "cache_hits": 0
+  },
+  "summary": {
+    "before": 9,
+    "after": 9,
+    "matched": 7,
+    "fallback": 2,
+    "average_confidence": 83.3,
+    "lowest_confidence": 70.1,
+    "highest_confidence": 97.7
+  },
+  "matches": [
+    {
+      "before": "/data/photos/2026-07/BRAVO/grass_cutting/before/1783264172165_614462944.jpg",
+      "after": "/data/photos/2026-07/BRAVO/grass_cutting/after/1783264214934_614462944.jpg",
+      "final_score": 0.701,
+      "phash_similarity": 0.75,
+      "orb_score": 0.05,
+      "histogram_score": 0.8785,
+      "ssim_score": 0.7908,
+      "edge_score": 0.2994,
+      "confidence": 70.1,
+      "good_matches": 10,
+      "inliers": 8
+    },
+    {
+      "before": "/data/photos/2026-07/BRAVO/grass_cutting/before/1783264174336_614462944.jpg",
+      "after": "/data/photos/2026-07/BRAVO/grass_cutting/after/1783264213609_614462944.jpg",
+      "final_score": 0.8588,
+      "phash_similarity": 0.5625,
+      "orb_score": 0.105,
+      "histogram_score": 0.8892,
+      "ssim_score": 0.8288,
+      "edge_score": 0.3026,
+      "confidence": 85.9,
+      "good_matches": 21,
+      "inliers": 8
+    },
+    {
+      "before": "/data/photos/2026-07/BRAVO/grass_cutting/before/1783264175770_614462944.jpg",
+      "after": "/data/photos/2026-07/BRAVO/grass_cutting/after/1783264205124_614462944.jpg",
+      "final_score": 0.9047,
+      "phash_similarity": 0.8125,
+      "orb_score": 0.18,
+      "histogram_score": 0.8366,
+      "ssim_score": 0.8601,
+      "edge_score": 0.289,
+      "confidence": 90.5,
+      "good_matches": 36,
+      "inliers": 29
+    },
+    {
+      "before": "/data/photos/2026-07/BRAVO/grass_cutting/before/1783264178857_614462944.jpg",
+      "after": "/data/photos/2026-07/BRAVO/grass_cutting/after/1783264207326_614462944.jpg",
+      "final_score": 0.9287,
+      "phash_similarity": 0.75,
+      "orb_score": 0.055,
+      "histogram_score": 0.9737,
+      "ssim_score": 0.882,
+      "edge_score": 0.2826,
+      "confidence": 92.9,
+      "good_matches": 11,
+      "inliers": 6
+    },
+    {
+      "before": "/data/photos/2026-07/BRAVO/grass_cutting/before/1783264180536_614462944.jpg",
+      "after": "/data/photos/2026-07/BRAVO/grass_cutting/after/1783264217424_614462944.jpg",
+      "final_score": 0.7305,
+      "phash_similarity": 0.5625,
+      "orb_score": 0.04,
+      "histogram_score": 0.7113,
+      "ssim_score": 0.5643,
+      "edge_score": 0.2566,
+      "confidence": 73.1,
+      "good_matches": 8,
+      "inliers": 6
+    },
+    {
+      "before": "/data/photos/2026-07/BRAVO/grass_cutting/before/1783264182748_614462944.jpg",
+      "after": "/data/photos/2026-07/BRAVO/grass_cutting/after/1783264216431_614462944.jpg",
+      "final_score": 0.9768,
+      "phash_similarity": 0.9062,
+      "orb_score": 0.075,
+      "histogram_score": 0.9858,
+      "ssim_score": 0.9414,
+      "edge_score": 0.3155,
+      "confidence": 97.7,
+      "good_matches": 15,
+      "inliers": 12
+    },
+    {
+      "before": "/data/photos/2026-07/BRAVO/grass_cutting/before/1783264185335_614462944.jpg",
+      "after": "/data/photos/2026-07/BRAVO/grass_cutting/after/1783264219059_614462944.jpg",
+      "final_score": 0.7262,
+      "phash_similarity": 0.5625,
+      "orb_score": 0.025,
+      "histogram_score": 0.9271,
+      "ssim_score": 0.6637,
+      "edge_score": 0.2148,
+      "confidence": 72.6,
+      "good_matches": 5,
+      "inliers": 5
+    }
+  ],
+  "unmatched": [
+    {
+      "before": "/data/photos/2026-07/BRAVO/grass_cutting/before/1783264184397_614462944.jpg",
+      "top_candidate": "/data/photos/2026-07/BRAVO/grass_cutting/after/1783264219059_614462944.jpg",
+      "phash_similarity": 0.625,
+      "orb_score": 0.015,
+      "orb_score_normalized": 0.015,
+      "histogram_score": 0.9388,
+      "histogram_score_normalized": 1.0,
+      "ssim_score": 0.8014,
+      "ssim_score_normalized": 1.0,
+      "edge_score": 0.246,
+      "edge_score_normalized": 0.5196,
+      "final_score": 0.4277,
+      "inliers": 0,
+      "reason": "below_threshold"
+    },
+    {
+      "before": "/data/photos/2026-07/BRAVO/grass_cutting/before/1783264186872_614462944.jpg",
+      "top_candidate": "/data/photos/2026-07/BRAVO/grass_cutting/after/1783264206488_614462944.jpg",
+      "phash_similarity": 0.5938,
+      "orb_score": 0.03,
+      "orb_score_normalized": 1.0,
+      "histogram_score": 0.5054,
+      "histogram_score_normalized": 0.0,
+      "ssim_score": 0.7238,
+      "ssim_score_normalized": 0.0,
+      "edge_score": 0.2792,
+      "edge_score_normalized": 0.0,
+      "final_score": 0.5935,
+      "inliers": 4,
+      "reason": "below_threshold"
+    }
+  ]
+}

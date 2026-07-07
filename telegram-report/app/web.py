@@ -11,6 +11,14 @@ from docx.shared import Inches, Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 import imagehash
 
+try:
+    from vision import ai_engine
+except ImportError:
+    try:
+        from app.vision import ai_engine
+    except ImportError:
+        ai_engine = None
+
 DATA_ROOT = Path(os.getenv("SAVE_ROOT", "/data/photos")).resolve()
 REPORT_ROOT = Path("/data/reports").resolve()
 REPORT_ROOT.mkdir(parents=True, exist_ok=True)
@@ -83,8 +91,54 @@ def score_pair(des_a, des_b) -> float:
             good += 1
     return min(1.0, good/200.0)
 
+def ai_label(confidence: float) -> str:
+    if confidence >= 0.70:
+        return "High"
+    if confidence >= 0.40:
+        return "Review"
+    return "Low"
+
+def run_ai_pair_review(pairs, progress: dict):
+    results = []
+    if ai_engine is None:
+        progress["ai_error"] = "AI engine unavailable"
+        progress["ai_results"] = results
+        return results
+
+    progress["ai_state"] = "running"
+    progress["ai_total"] = len(pairs)
+    progress["ai_done"] = 0
+
+    for idx, pair in enumerate(pairs):
+        before_path, after_path, cpu_score = pair
+        try:
+            result = ai_engine.match(str(before_path), str(after_path))
+        except Exception as exc:
+            result = {
+                "confidence": 0.0,
+                "matches": 0,
+                "keypoints_before": 0,
+                "keypoints_after": 0,
+                "processing_time_ms": 0.0,
+                "error": str(exc),
+            }
+        confidence = float(result.get("confidence") or 0.0)
+        result.update({
+            "before": str(before_path),
+            "after": str(after_path),
+            "cpu_score": cpu_score,
+            "label": ai_label(confidence),
+        })
+        results.append(result)
+        progress["ai_done"] = idx + 1
+        progress["ai_results"] = results
+
+    progress["ai_state"] = "done"
+    progress["ai_results"] = results
+    return results
+
 def build_report(input_root: Path, out_path: Path, company: str, zone: str, title: str,
-                 threshold: float, progress: dict):
+                 threshold: float, progress: dict, ai_review: bool=False):
     before_dir = input_root / "before"
     after_dir  = input_root / "after"
     befores = load_images(before_dir)
@@ -138,6 +192,13 @@ def build_report(input_root: Path, out_path: Path, company: str, zone: str, titl
                 pairs.append((b, afters[j], -1.0))
                 progress["unmatched"] += 1
         progress["done"] = idx + 1
+
+    progress["ai_enabled"] = bool(ai_review)
+    progress["ai_results"] = []
+    if ai_review:
+        run_ai_pair_review(pairs, progress)
+    else:
+        progress["ai_state"] = "disabled"
 
     # DOCX (table layout)
     doc = Document()
@@ -220,7 +281,7 @@ def push(job_id):
     if q:
         q.put(json.dumps(JOBS[job_id]))
 
-def run_job(job_id, month, site, task, company, zone, title, threshold):
+def run_job(job_id, month, site, task, company, zone, title, threshold, ai_review=False):
     try:
         from queue import Queue
         JOBS[job_id].update(state="starting", done=0, total=0)
@@ -228,7 +289,7 @@ def run_job(job_id, month, site, task, company, zone, title, threshold):
         input_root = DATA_ROOT / month / site / task
         out_name = f"{month}_{site}_{'grass_cutting' if task=='grass_cutting' else 'drainage'}.docx"
         out_path = REPORT_ROOT / out_name
-        build_report(input_root, out_path, company, zone, title, threshold, JOBS[job_id])
+        build_report(input_root, out_path, company, zone, title, threshold, JOBS[job_id], ai_review=ai_review)
         push(job_id)
     except Exception as e:
         JOBS[job_id].update(state="error", error=str(e)); push(job_id)
@@ -248,13 +309,14 @@ def start():
     zone    = data.get("zone", f"{site} ZONE").strip()
     title   = data.get("title","1. Grass Cutting" if task=="grass_cutting" else "2. Drainage Cleaning").strip()
     threshold = float(data.get("threshold","0.70"))
+    ai_review = data.get("ai_review") == "1"
     if not month or not site:
         return jsonify({"ok": False, "error": "Please choose a month and a site"}), 400
     job_id = uuid.uuid4().hex
     from queue import Queue
-    JOBS[job_id] = {"state":"queued","done":0,"total":0,"matched":0,"unmatched":0,"before":0,"after":0,"pages":0}
+    JOBS[job_id] = {"state":"queued","done":0,"total":0,"matched":0,"unmatched":0,"before":0,"after":0,"pages":0,"ai_enabled":ai_review,"ai_results":[],"ai_error":None,"ai_state":"disabled"}
     EVENTS[job_id] = Queue()
-    threading.Thread(target=run_job, args=(job_id, month, site, task, company, zone, title, threshold), daemon=True).start()
+    threading.Thread(target=run_job, args=(job_id, month, site, task, company, zone, title, threshold, ai_review), daemon=True).start()
     return jsonify({"ok": True, "job_id": job_id})
 
 @app.get("/progress/<job_id>")

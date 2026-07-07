@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-import os, re, subprocess, threading, uuid
+import csv, json, os, re, subprocess, threading, uuid
+from datetime import datetime
 from pathlib import Path
 from typing import List, Dict
 from urllib import parse, request as urlrequest
@@ -11,6 +12,14 @@ from docx import Document
 from docx.shared import Cm, Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
 from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ALIGN_VERTICAL
+
+try:
+    from vision import ai_engine
+except ImportError:
+    try:
+        from app.vision import ai_engine
+    except ImportError:
+        ai_engine = None
 
 try:
     import importlib.util
@@ -93,6 +102,307 @@ IMG_H_CM = float(os.getenv("IMG_H_CM", "4.3"))
 class CancelledJob(Exception):
     pass
 
+def ai_label(confidence: float) -> str:
+    if confidence >= 0.70:
+        return "High"
+    if confidence >= 0.40:
+        return "Review"
+    return "Low"
+
+def summarize_ai_results(results):
+    if not results:
+        return {
+            "total": 0,
+            "high_count": 0,
+            "review_count": 0,
+            "low_count": 0,
+            "average_ai_confidence": 0.0,
+            "lowest_ai_confidence": 0.0,
+            "highest_ai_confidence": 0.0,
+            "average_processing_time_ms": 0.0,
+        }
+
+    confidences = [float(item.get("confidence") or 0.0) for item in results]
+    times = [float(item.get("processing_time_ms") or 0.0) for item in results]
+    return {
+        "total": len(results),
+        "high_count": sum(1 for item in results if item.get("label") == "High"),
+        "review_count": sum(1 for item in results if item.get("label") == "Review"),
+        "low_count": sum(1 for item in results if item.get("label") == "Low"),
+        "average_ai_confidence": round(sum(confidences) / len(confidences), 4),
+        "lowest_ai_confidence": round(min(confidences), 4),
+        "highest_ai_confidence": round(max(confidences), 4),
+        "average_processing_time_ms": round(sum(times) / len(times), 2),
+    }
+
+def calibration_enabled():
+    return os.getenv("AI_CALIBRATION_ENABLED", "").lower() in {"1", "true", "yes", "on"}
+
+def calibration_csv_path():
+    return Path(os.getenv("AI_CALIBRATION_CSV", "/data/reports_dev/ai_calibration.csv"))
+
+def ai_recovery_enabled():
+    return os.getenv("AI_RECOVERY_ENABLED", "").lower() in {"1", "true", "yes", "on"}
+
+def ai_recovery_threshold():
+    try:
+        return float(os.getenv("AI_RECOVERY_THRESHOLD", "0.55"))
+    except ValueError:
+        return 0.55
+
+def safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+def check_ai_service(progress):
+    if ai_engine is None:
+        health = {"ok": False, "error": "AI engine unavailable"}
+    elif hasattr(ai_engine, "health"):
+        try:
+            health = ai_engine.health()
+        except Exception as exc:
+            health = {"ok": False, "error": f"AI service health check failed: {exc}"}
+    else:
+        health = {"ok": False, "error": "AI service health check unavailable"}
+    progress["ai_service_health"] = health
+    return bool(health.get("ok"))
+
+def append_ai_calibration_rows(report_name, results):
+    if not calibration_enabled() or not results:
+        return
+
+    path = calibration_csv_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = [
+        "created_at",
+        "report_name",
+        "before_image",
+        "after_image",
+        "cpu_confidence",
+        "ai_confidence",
+        "matches",
+        "keypoints_before",
+        "keypoints_after",
+        "processing_time_ms",
+        "final_label",
+        "error",
+    ]
+
+    exists = path.exists()
+    with open(path, "a", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields)
+        if not exists:
+            writer.writeheader()
+
+        created_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        for item in results:
+            writer.writerow(
+                {
+                    "created_at": created_at,
+                    "report_name": report_name,
+                    "before_image": item.get("before"),
+                    "after_image": item.get("after"),
+                    "cpu_confidence": item.get("cpu_score"),
+                    "ai_confidence": item.get("confidence"),
+                    "matches": item.get("matches"),
+                    "keypoints_before": item.get("keypoints_before"),
+                    "keypoints_after": item.get("keypoints_after"),
+                    "processing_time_ms": item.get("processing_time_ms"),
+                    "final_label": item.get("label"),
+                    "error": item.get("error"),
+                }
+            )
+
+def pair_paths(pair):
+    if isinstance(pair, dict):
+        return pair.get("before"), pair.get("after"), pair.get("score") or pair.get("final_score")
+    if isinstance(pair, (list, tuple)) and len(pair) >= 2:
+        score = pair[2] if len(pair) > 2 else None
+        return pair[0], pair[1], score
+    return None, None, None
+
+def run_ai_pair_review(pairs, progress: dict, should_cancel=None):
+    should_cancel = should_cancel or (lambda: False)
+    results = []
+    progress["ai_results"] = results
+    progress["ai_error"] = None
+
+    if ai_engine is None:
+        progress["ai_state"] = "error"
+        progress["ai_error"] = "AI engine unavailable"
+        return results
+
+    progress["ai_state"] = "running"
+    progress["ai_total"] = len(pairs)
+    progress["ai_done"] = 0
+
+    for idx, pair in enumerate(pairs):
+        if should_cancel():
+            raise CancelledJob("Cancelled by user")
+
+        before_path, after_path, cpu_score = pair_paths(pair)
+        if not before_path or not after_path:
+            result = {
+                "confidence": 0.0,
+                "matches": 0,
+                "keypoints_before": 0,
+                "keypoints_after": 0,
+                "processing_time_ms": 0.0,
+                "error": "Invalid pair data",
+            }
+        else:
+            try:
+                result = ai_engine.match(str(before_path), str(after_path))
+            except Exception as exc:
+                result = {
+                    "confidence": 0.0,
+                    "matches": 0,
+                    "keypoints_before": 0,
+                    "keypoints_after": 0,
+                    "processing_time_ms": 0.0,
+                    "error": str(exc),
+                }
+
+        confidence = float(result.get("confidence") or 0.0)
+        result.update({
+            "before": str(before_path) if before_path else None,
+            "after": str(after_path) if after_path else None,
+            "cpu_score": cpu_score,
+            "label": ai_label(confidence),
+        })
+        results.append(result)
+        progress["ai_done"] = idx + 1
+        progress["ai_results"] = results
+
+    progress["ai_state"] = "done"
+    progress["ai_summary"] = summarize_ai_results(results)
+    return results
+
+def run_ai_recovery(befores, afters, pairs, progress: dict, should_cancel=None):
+    threshold = ai_recovery_threshold()
+    stats = {
+        "enabled": ai_recovery_enabled(),
+        "threshold": threshold,
+        "attempted": 0,
+        "recovered": 0,
+        "failed": 0,
+        "comparisons": 0,
+        "results": [],
+        "failed_candidates": [],
+        "errors": [],
+    }
+    progress["ai_recovery"] = stats
+
+    if not stats["enabled"]:
+        return pairs
+    if ai_engine is None:
+        stats["errors"].append("AI engine unavailable")
+        stats["failed_candidates"].append({
+            "before": None,
+            "best_after": None,
+            "best_confidence": 0.0,
+            "threshold": threshold,
+            "reason": "ai_engine_unavailable",
+        })
+        return pairs
+
+    should_cancel = should_cancel or (lambda: False)
+    used_after = set()
+    for pair in pairs:
+        if isinstance(pair, (list, tuple)) and len(pair) > 1:
+            used_after.add(str(pair[1]))
+        else:
+            _, after_path, _ = pair_paths(pair)
+            if after_path:
+                used_after.add(str(after_path))
+
+    remaining_after = [path for path in afters if str(path) not in used_after]
+    unmatched_before = [
+        Path(item["before"])
+        for item in progress.get("unmatched_debug", [])
+        if item.get("before")
+    ]
+
+    for before_path in unmatched_before:
+        if should_cancel():
+            raise CancelledJob("Cancelled by user")
+        if not remaining_after:
+            stats["failed_candidates"].append({
+                "before": str(before_path),
+                "best_after": None,
+                "best_confidence": 0.0,
+                "threshold": threshold,
+                "reason": "no_remaining_after_images",
+            })
+            break
+
+        stats["attempted"] += 1
+        best_after = None
+        best_result = None
+        best_confidence = -1.0
+
+        for after_path in list(remaining_after):
+            if should_cancel():
+                raise CancelledJob("Cancelled by user")
+            stats["comparisons"] += 1
+            try:
+                result = ai_engine.match(str(before_path), str(after_path))
+            except Exception as exc:
+                stats["errors"].append(
+                    {
+                        "before": str(before_path),
+                        "after": str(after_path),
+                        "error": str(exc),
+                    }
+                )
+                continue
+
+            if result.get("error"):
+                stats["errors"].append(
+                    {
+                        "before": str(before_path),
+                        "after": str(after_path),
+                        "error": result.get("error"),
+                    }
+                )
+                continue
+
+            confidence = safe_float(result.get("confidence"), 0.0)
+            if confidence > best_confidence:
+                best_confidence = confidence
+                best_after = after_path
+                best_result = result
+
+        if best_after and best_result and best_confidence >= threshold:
+            recovered = {
+                **best_result,
+                "before": str(before_path),
+                "after": str(best_after),
+                "confidence": best_confidence,
+                "label": "ai_recovered",
+            }
+            stats["recovered"] += 1
+            stats["results"].append(recovered)
+            remaining_after.remove(best_after)
+            pairs.append((before_path, best_after, best_confidence))
+        else:
+            stats["failed"] += 1
+            stats["failed_candidates"].append({
+                "before": str(before_path),
+                "best_after": str(best_after) if best_after else None,
+                "best_confidence": round(best_confidence, 4) if best_confidence >= 0 else 0.0,
+                "threshold": threshold,
+                "reason": "below_threshold" if best_after else "no_valid_ai_candidate",
+            })
+
+    if stats["recovered"]:
+        progress["matched"] = int(progress.get("matched", 0)) + stats["recovered"]
+        progress["unmatched"] = max(0, int(progress.get("unmatched", 0)) - stats["recovered"])
+
+    return pairs
+
 def notify_telegram(message: str) -> None:
     token = os.getenv("TG_BOT_TOKEN")
     chat_id = os.getenv("TG_CHAT_ID")
@@ -165,8 +475,65 @@ def load_images(folder: Path):
     exts = {".jpg",".jpeg",".png",".bmp",".tif",".tiff",".webp"}
     return storage.list_files(folder, exts)
 
+def write_debug_report(out_path: Path, progress: dict):
+    debug_path = out_path.with_suffix(".debug.json")
+    debug_data = {
+        "report": str(out_path),
+        "backend_used": progress.get("backend_used"),
+        "backend_requested": progress.get("backend_requested"),
+        "processing_time": {
+            "matching_time_sec": progress.get("matching_time_sec", 0),
+            "avg_time_per_image_sec": progress.get("avg_time_per_image_sec", 0),
+            "images_per_sec": progress.get("images_per_sec", 0),
+        },
+        "performance": {
+            "candidate_comparisons": progress.get("candidate_comparisons", 0),
+            "cache_hits": progress.get("cache_hits", 0),
+            "feature_cache_hits": progress.get("feature_cache_hits", 0),
+            "feature_cache_misses": progress.get("feature_cache_misses", 0),
+            "feature_cache_path": progress.get("feature_cache_path"),
+        },
+        "summary": {
+            "before": progress.get("before", 0),
+            "after": progress.get("after", 0),
+            "matched": progress.get("matched", 0),
+            "fallback": progress.get("unmatched", 0),
+            "average_confidence": progress.get("average_confidence", 0),
+            "lowest_confidence": progress.get("lowest_confidence", 0),
+            "highest_confidence": progress.get("highest_confidence", 0),
+        },
+        "matches": progress.get("match_debug", []),
+        "unmatched": progress.get("unmatched_debug", []),
+        "image_errors": progress.get("image_errors", []),
+        "ai_service_health": progress.get("ai_service_health"),
+        "ai_review": {
+            "enabled": progress.get("ai_enabled", False),
+            "state": progress.get("ai_state", "disabled"),
+            "error": progress.get("ai_error"),
+            "total": progress.get("ai_total", 0),
+            "done": progress.get("ai_done", 0),
+            "summary": progress.get("ai_summary") or summarize_ai_results(progress.get("ai_results", [])),
+            "results": progress.get("ai_results", []),
+            "calibration_error": progress.get("ai_calibration_error"),
+        },
+        "ai_recovery": progress.get("ai_recovery", {
+            "enabled": False,
+            "threshold": ai_recovery_threshold(),
+            "attempted": 0,
+            "recovered": 0,
+            "failed": 0,
+            "comparisons": 0,
+            "results": [],
+            "failed_candidates": [],
+            "errors": [],
+        }),
+    }
+    with open(debug_path, "w", encoding="utf-8") as fh:
+        json.dump(debug_data, fh, indent=2)
+    return debug_path
+
 def build_report(input_root: Path, out_path: Path, company: str, zone: str, title: str,
-                 threshold: float, progress: dict, should_cancel=None, backend="cpu"):
+                 threshold: float, progress: dict, should_cancel=None, backend="cpu", ai_review=False):
     should_cancel = should_cancel or (lambda: False)
     if should_cancel():
         raise CancelledJob("Cancelled by user")
@@ -190,6 +557,22 @@ def build_report(input_root: Path, out_path: Path, company: str, zone: str, titl
         cancelled_exception=CancelledJob,
         backend=backend,
     )
+
+    progress["ai_enabled"] = bool(ai_review)
+    progress["ai_results"] = []
+    progress["ai_error"] = None
+    if ai_review or ai_recovery_enabled():
+        check_ai_service(progress)
+    if ai_review:
+        run_ai_pair_review(pairs, progress, should_cancel)
+        try:
+            append_ai_calibration_rows(out_path.name, progress.get("ai_results", []))
+        except Exception as exc:
+            progress["ai_calibration_error"] = str(exc)
+    else:
+        progress["ai_state"] = "disabled"
+
+    pairs = run_ai_recovery(befores, afters, pairs, progress, should_cancel)
 
     doc = Document()
     for section in doc.sections:
@@ -273,7 +656,8 @@ def build_report(input_root: Path, out_path: Path, company: str, zone: str, titl
     if should_cancel():
         raise CancelledJob("Cancelled by user")
     doc.save(out_path)
-    progress.update(state="done", download=str(out_path))
+    debug_path = write_debug_report(out_path, progress)
+    progress.update(state="done", download=str(out_path), debug_download=str(debug_path))
 
 app = Flask(__name__)
 
@@ -304,17 +688,19 @@ def create_report_job(payload):
     title = str(payload["title"]).strip()
     threshold = float(payload["threshold"])
     backend = str(payload.get("backend", "cpu")).strip().lower() or "cpu"
+    ai_review = str(payload.get("ai_review", "")).lower() in {"1", "true", "yes", "on"}
     job_id = uuid.uuid4().hex
     job_payload = dict(payload)
     job_payload["threshold"] = threshold
     job_payload["backend"] = backend
+    job_payload["ai_review"] = ai_review
     job_manager.create(
         job_id,
         name=f"{month} {site} {task}",
         payload=job_payload,
-        state={"state":"queued","done":0,"total":0,"matched":0,"unmatched":0,"before":0,"after":0,"pages":0},
+        state={"state":"queued","done":0,"total":0,"matched":0,"unmatched":0,"before":0,"after":0,"pages":0,"ai_enabled":ai_review,"ai_results":[],"ai_error":None,"ai_state":"disabled"},
     )
-    queue_manager.submit(run_job, job_id, month, site, task, company, zone, title, threshold, backend)
+    queue_manager.submit(run_job, job_id, month, site, task, company, zone, title, threshold, backend, ai_review)
     return job_id
 
 def clean_saved_payload(job):
@@ -332,7 +718,7 @@ def validate_report_payload(payload):
         return "Invalid saved job threshold"
     return None
 
-def run_job(job_id, month, site, task, company, zone, title, threshold, backend="cpu"):
+def run_job(job_id, month, site, task, company, zone, title, threshold, backend="cpu", ai_review=False):
     try:
         job = job_manager.get_state(job_id)
         if job_manager.is_cancelled(job_id):
@@ -344,7 +730,7 @@ def run_job(job_id, month, site, task, company, zone, title, threshold, backend=
         legacy_name = "drainage" if task == "drainage_cleaning" else task
         out_name = f"{month}_{site}_{legacy_name}.docx"
         out_path = REPORT_ROOT / out_name
-        build_report(input_root, out_path, company, zone, title, threshold, job, lambda: job_manager.is_cancelled(job_id), backend)
+        build_report(input_root, out_path, company, zone, title, threshold, job, lambda: job_manager.is_cancelled(job_id), backend, ai_review)
         notify_telegram(f"Report job completed: {out_name}")
         push(job_id)
     except CancelledJob:
@@ -426,9 +812,10 @@ def start():
     title   = data.get("title", (task_row or {}).get("title") or defaults["title"]).strip()
     threshold = float(data.get("threshold", defaults["threshold"]))
     backend = data.get("backend", "cpu").strip().lower() or "cpu"
+    ai_review = data.get("ai_review") == "1"
     if not month or not site:
         return jsonify({"ok": False, "error": "Please choose a month and a site"}), 400
-    payload = {"month": month, "site": site, "task": task, "company": company, "zone": zone, "title": title, "threshold": threshold, "backend": backend}
+    payload = {"month": month, "site": site, "task": task, "company": company, "zone": zone, "title": title, "threshold": threshold, "backend": backend, "ai_review": ai_review}
     job_id = create_report_job(payload)
     return jsonify({"ok": True, "job_id": job_id})
 
@@ -550,6 +937,21 @@ def download_job(job_id):
     if not path.exists() or not path.is_file():
         return "Not found", 404
     return send_file(path, as_attachment=True)
+
+@app.get("/download/debug/<job_id>")
+def download_debug(job_id):
+    job = job_manager.get_job(job_id)
+    if not job or not job.get("result_path"):
+        return "Not found", 404
+    report_path = Path(job["result_path"]).resolve()
+    try:
+        report_path.relative_to(REPORT_ROOT.resolve())
+    except ValueError:
+        return "Not found", 404
+    debug_path = report_path.with_suffix(".debug.json")
+    if not debug_path.exists() or not debug_path.is_file():
+        return "Not found", 404
+    return send_file(debug_path, as_attachment=True)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080, debug=False)

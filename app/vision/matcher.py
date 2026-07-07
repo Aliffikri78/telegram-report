@@ -9,8 +9,10 @@ import numpy as np
 from PIL import Image
 
 try:
+    from vision import ai_matcher
     from vision.feature_cache import FeatureCache
 except ImportError:
+    from app.vision import ai_matcher
     from app.vision.feature_cache import FeatureCache
 
 
@@ -29,7 +31,7 @@ MATCH_WEIGHT_EDGE = float(os.getenv("MATCH_WEIGHT_EDGE", "0.10"))
 MATCH_ASSIGNMENT = os.getenv("MATCH_ASSIGNMENT", "greedy").strip().lower()
 
 Pair = Tuple[Path, Path, float]
-VALID_BACKENDS = {"auto", "cpu", "gpu"}
+VALID_BACKENDS = {"auto", "cpu", "gpu", "ai"}
 VALID_ASSIGNMENTS = {"greedy", "hungarian", "auto"}
 
 
@@ -56,6 +58,12 @@ def resolve_backend(requested: str) -> Tuple[str, str, str]:
         return requested, "cpu", "CPU matcher selected"
     if requested == "auto":
         return requested, "cpu", "GPU backend not implemented yet; using CPU"
+    if requested == "ai":
+        available, note = ai_matcher.availability()
+        implemented = bool(getattr(ai_matcher, "IMPLEMENTED", False))
+        if available and implemented:
+            return requested, "ai", "AI matcher selected"
+        return requested, "cpu", f"{note}; using CPU"
     if opencv_cuda_available():
         return requested, "cpu", "GPU backend not implemented yet; using CPU"
     return requested, "cpu", "OpenCV CUDA unavailable; using CPU"
@@ -96,6 +104,8 @@ def deserialize_keypoints(items) -> List:
 
 def compute_features(path: Path, orb, cache: FeatureCache):
     gray = imread_gray_resized(path)
+    if gray is None:
+        raise ValueError("OpenCV could not decode image")
     cached = cache.get(path, MAX_SIDE, NFEATURES) if cache else None
     if cached:
         try:
@@ -109,7 +119,7 @@ def compute_features(path: Path, orb, cache: FeatureCache):
             pass
 
     image_hash = phash(path)
-    keypoints, descriptors = orb.detectAndCompute(gray, None) if gray is not None else (None, None)
+    keypoints, descriptors = orb.detectAndCompute(gray, None)
     if cache:
         cache.set(
             path,
@@ -122,6 +132,33 @@ def compute_features(path: Path, orb, cache: FeatureCache):
             },
         )
     return image_hash, gray, keypoints or [], descriptors
+
+
+def image_error(path: Path, error: Exception) -> Dict:
+    return {"image": str(path), "error": str(error)}
+
+
+def load_feature_set(paths, orb, cache, should_cancel, cancelled_exception):
+    valid_paths = []
+    hashes = []
+    keypoints = {}
+    descriptors = {}
+    grays = {}
+    errors = []
+    for p in paths:
+        if should_cancel():
+            raise cancelled_exception("Cancelled by user")
+        try:
+            image_hash, gray, kp, desc = compute_features(p, orb, cache)
+        except Exception as exc:
+            errors.append(image_error(p, exc))
+            continue
+        valid_paths.append(p)
+        hashes.append(image_hash)
+        grays[p] = gray
+        keypoints[p] = kp or []
+        descriptors[p] = desc
+    return valid_paths, hashes, keypoints, descriptors, grays, errors
 
 
 def hamming(a: int, b: int) -> int:
@@ -676,35 +713,24 @@ def match_pairs(
     candidate_comparisons = 0
     threshold = max(0.50, float(threshold or 0.0))
     backend_requested, backend_used, backend_note = resolve_backend(backend)
+    ai_status = ai_matcher.status() if backend_requested == "ai" else {}
     progress.update(
         backend_requested=backend_requested,
         backend_used=backend_used,
         backend_note=backend_note,
+        ai_available=bool(ai_status.get("implemented") and ai_status.get("model_available")),
+        ai_device=ai_matcher.device_name() if backend_requested == "ai" else None,
+        ai_model_loaded=bool(ai_status.get("model_loaded")),
     )
 
     orb = cv2.ORB_create(nfeatures=NFEATURES)
-    be_ph, af_ph = [], []
-    be_kp, af_kp = {}, {}
-    be_desc, af_desc = {}, {}
-    be_gray, af_gray = {}, {}
-
-    for p in befores:
-        if should_cancel():
-            raise cancelled_exception("Cancelled by user")
-        image_hash, arr, k, d = compute_features(p, orb, feature_cache)
-        be_ph.append(image_hash)
-        be_gray[p] = arr
-        be_kp[p] = k or []
-        be_desc[p] = d
-
-    for p in afters:
-        if should_cancel():
-            raise cancelled_exception("Cancelled by user")
-        image_hash, arr, k, d = compute_features(p, orb, feature_cache)
-        af_ph.append(image_hash)
-        af_gray[p] = arr
-        af_kp[p] = k or []
-        af_desc[p] = d
+    befores, be_ph, be_kp, be_desc, be_gray, be_errors = load_feature_set(
+        befores, orb, feature_cache, should_cancel, cancelled_exception
+    )
+    afters, af_ph, af_kp, af_desc, af_gray, af_errors = load_feature_set(
+        afters, orb, feature_cache, should_cancel, cancelled_exception
+    )
+    image_errors = be_errors + af_errors
 
     progress.update(
         state="matching",
@@ -721,6 +747,8 @@ def match_pairs(
         feature_cache_hits=feature_cache.cache_hits,
         feature_cache_misses=feature_cache.cache_misses,
         feature_cache_path=str(feature_cache.path),
+        image_errors=image_errors,
+        skipped_images=len(image_errors),
         average_confidence=0.0,
         lowest_confidence=0.0,
         highest_confidence=0.0,
@@ -892,6 +920,8 @@ def match_pairs(
     progress["feature_cache_hits"] = feature_cache.cache_hits
     progress["feature_cache_misses"] = feature_cache.cache_misses
     progress["feature_cache_path"] = str(feature_cache.path)
+    progress["image_errors"] = image_errors
+    progress["skipped_images"] = len(image_errors)
     feature_cache.save()
 
     return pairs

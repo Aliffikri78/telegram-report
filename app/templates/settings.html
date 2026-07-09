@@ -14,11 +14,17 @@
     table{border-collapse:collapse;width:100%}
     th,td{border-bottom:1px solid #eee;text-align:left;padding:8px}
     h2{margin-top:0}
+    .notice{display:none;border-radius:6px;padding:10px 12px;margin:12px 0}
+    .notice.show{display:block}
+    .notice.success{background:#ecfdf3;color:#027a48;border:1px solid #abefc6}
+    .notice.error{background:#fef3f2;color:#b42318;border:1px solid #fecdca}
+    .notice.info{background:#eff8ff;color:#175cd3;border:1px solid #b2ddff}
   </style>
 </head>
 <body>
   <p><a href="/">Report Builder</a></p>
   <h2>Settings</h2>
+  <div id="settingsNotice" class="notice" role="status" aria-live="polite"></div>
 
   <div class="section" data-entity="companies">
     <h3>Companies</h3>
@@ -120,38 +126,117 @@
   </div>
 
 <script>
+const notice = document.getElementById('settingsNotice');
+
+function showNotice(type, text){
+  notice.className = `notice show ${type}`;
+  notice.textContent = text;
+}
+
+function clearNotice(){
+  notice.className = 'notice';
+  notice.textContent = '';
+}
+
+function entityLabel(entity){
+  return String(entity || '').replace(/_/g, ' ');
+}
+
 function rowData(root){
   const data = {};
   root.querySelectorAll('input,select').forEach(el => data[el.name] = el.value);
   return data;
 }
-document.querySelectorAll('.create-form').forEach(form => {
-  form.addEventListener('submit', async e => {
-    e.preventDefault();
-    const entity = form.closest('.section').dataset.entity;
-    const r = await fetch(`/api/settings/${entity}`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(rowData(form))});
-    const j = await r.json();
-    if(!j.ok) alert(j.error || 'Failed'); else location.reload();
-  });
+
+async function refreshSection(entity){
+  const r = await fetch('/settings');
+  if(!r.ok) throw new Error('Settings refresh failed');
+  const html = await r.text();
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  const next = doc.querySelector(`.section[data-entity="${entity}"]`);
+  const current = document.querySelector(`.section[data-entity="${entity}"]`);
+  if(!next || !current) throw new Error('Settings section refresh failed');
+  current.replaceWith(next);
+}
+
+async function readJson(response){
+  try{
+    return await response.json();
+  }catch(e){
+    return {ok:false, error:'Invalid server response'};
+  }
+}
+
+async function createItem(form){
+  const section = form.closest('.section');
+  const entity = section.dataset.entity;
+  clearNotice();
+  showNotice('info', `Adding ${entityLabel(entity)}...`);
+  const r = await fetch(`/api/settings/${entity}`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(rowData(form))});
+  const j = await readJson(r);
+  if(!j.ok){
+    showNotice('error', j.error || `Failed to add ${entityLabel(entity)}.`);
+    return;
+  }
+  await refreshSection(entity);
+  showNotice('success', `Added ${entityLabel(entity)}.`);
+}
+
+async function saveItem(btn){
+  const section = btn.closest('.section');
+  const row = btn.closest('tr');
+  const entity = section.dataset.entity;
+  clearNotice();
+  showNotice('info', `Saving ${entityLabel(entity)}...`);
+  const r = await fetch(`/api/settings/${entity}/${row.dataset.id}`, {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(rowData(row))});
+  const j = await readJson(r);
+  if(!j.ok){
+    showNotice('error', j.error || `Failed to save ${entityLabel(entity)}.`);
+    return;
+  }
+  await refreshSection(entity);
+  showNotice('success', `Saved ${entityLabel(entity)}.`);
+}
+
+async function deleteItem(btn){
+  if(!confirm('Delete this item?')) return;
+  const section = btn.closest('.section');
+  const row = btn.closest('tr');
+  const entity = section.dataset.entity;
+  clearNotice();
+  showNotice('info', `Deleting ${entityLabel(entity)}...`);
+  const r = await fetch(`/api/settings/${entity}/${row.dataset.id}`, {method:'DELETE'});
+  const j = await readJson(r);
+  if(!j.ok){
+    showNotice('error', j.error || `Failed to delete ${entityLabel(entity)}.`);
+    return;
+  }
+  await refreshSection(entity);
+  showNotice('success', `Deleted ${entityLabel(entity)}.`);
+}
+
+document.addEventListener('submit', async e => {
+  if(!e.target.matches('.create-form')) return;
+  e.preventDefault();
+  try{
+    await createItem(e.target);
+  }catch(err){
+    showNotice('error', err.message || 'Action failed.');
+  }
 });
-document.querySelectorAll('.save').forEach(btn => {
-  btn.addEventListener('click', async () => {
-    const section = btn.closest('.section');
-    const row = btn.closest('tr');
-    const r = await fetch(`/api/settings/${section.dataset.entity}/${row.dataset.id}`, {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(rowData(row))});
-    const j = await r.json();
-    if(!j.ok) alert(j.error || 'Failed'); else location.reload();
-  });
-});
-document.querySelectorAll('.delete').forEach(btn => {
-  btn.addEventListener('click', async () => {
-    if(!confirm('Delete this item?')) return;
-    const section = btn.closest('.section');
-    const row = btn.closest('tr');
-    const r = await fetch(`/api/settings/${section.dataset.entity}/${row.dataset.id}`, {method:'DELETE'});
-    const j = await r.json();
-    if(!j.ok) alert(j.error || 'Failed'); else location.reload();
-  });
+
+document.addEventListener('click', async e => {
+  const saveBtn = e.target.closest('.save');
+  const deleteBtn = e.target.closest('.delete');
+  try{
+    if(saveBtn){
+      await saveItem(saveBtn);
+    }else if(deleteBtn){
+      await deleteItem(deleteBtn);
+    }
+  }catch(err){
+    showNotice('error', err.message || 'Action failed.');
+  }
 });
 </script>
 </body>

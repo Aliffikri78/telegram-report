@@ -12,10 +12,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY telegram-report/requirements-ai.txt /tmp/requirements-ai.txt
+COPY requirements-ai.txt /tmp/requirements-ai.txt
 RUN python -m pip install --no-cache-dir --upgrade pip \
     && python -m pip install --no-cache-dir -r /tmp/requirements-ai.txt
 
-COPY telegram-report/app /app/app
+COPY app /app/app
 
 CMD ["python", "/app/app/vision/ai_smoke_test.py"]

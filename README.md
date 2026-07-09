@@ -36,10 +36,17 @@ docker compose up --build
 - Margins: **2.0 cm** all sides.
 - Only matched pairs kept (filename + visual score).
 
+## Runtime Startup
+- Docker starts from `Dockerfile`, which runs `run_all.sh`.
+- `run_all.sh` starts `app/telegram_bot.py` in the background, then starts root `web.py`.
+- Root `web.py` is a compatibility launcher that loads the canonical Flask app from `app/web.py`.
+- The canonical web application is `app/web.py`.
+- Container port must remain `8080` for now; the current web entry binds to port 8080.
+
 ## Dev (no Docker)
 ```
 pip install -r requirements.txt
-python app.py
+python web.py
 ```
 Then open http://localhost:8080
 

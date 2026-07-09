@@ -8,9 +8,9 @@ if [[ -f /app/run_all.sh ]]; then
   exec bash -lc "/app/run_all.sh"
 fi
 
-if [[ -f /app/app.py ]]; then
-  echo "[entrypoint] run_all.sh not found, starting python app.py"
-  exec python3 /app/app.py
+if [[ -f /app/web.py ]]; then
+  echo "[entrypoint] run_all.sh not found, starting python /app/web.py"
+  exec python3 /app/web.py
 fi
 
 echo "[entrypoint] No run target found. Sleeping..."

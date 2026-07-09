@@ -1,0 +1,476 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
+  <title>Worker Upload</title>
+  <style>
+    :root{color-scheme:light;--bg:#f8fafc;--panel:#fff;--text:#111827;--muted:#4b5563;--border:#e5e7eb;--blue:#2563eb;--blue-dark:#1d4ed8;--green:#16a34a;--red:#dc2626;--amber:#d97706;--soft:#f3f4f6}
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;-webkit-font-smoothing:antialiased}
+    .app{max-width:680px;margin:0 auto;min-height:100vh;padding:14px 14px calc(92px + env(safe-area-inset-bottom))}
+    header{position:sticky;top:0;z-index:5;background:rgba(248,250,252,.96);backdrop-filter:blur(10px);padding:10px 0 12px;margin-bottom:4px}
+    .top{display:flex;align-items:center;justify-content:space-between;gap:12px}
+    h1{font-size:22px;line-height:1.15;margin:0;font-weight:700;letter-spacing:0}
+    h2{font-size:18px;line-height:1.25;margin:0 0 10px;font-weight:700;letter-spacing:0}
+    h3{font-size:15px;line-height:1.3;margin:0;font-weight:700;letter-spacing:0}
+    a{color:#1d4ed8;text-decoration:none;font-weight:600}
+    .job-id{font-size:13px;color:var(--muted);margin-top:4px}
+    .steps{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin-top:14px}
+    .step{border:1px solid var(--border);border-radius:10px;background:#fff;padding:8px 4px;text-align:center;font-size:12px;color:var(--muted);font-weight:700}
+    .step.active{border-color:var(--blue);background:#dbeafe;color:#1e40af}
+    .step.done{border-color:#bbf7d0;background:#dcfce7;color:#166534}
+    .stack{display:flex;flex-direction:column;gap:14px}
+    .card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:14px;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+    .fields{display:grid;grid-template-columns:1fr;gap:12px}
+    label span,.label-text{display:block;font-size:13px;color:#1f2937;margin-bottom:5px;font-weight:650}
+    select,input{width:100%;min-height:48px;border:1px solid #d1d5db;border-radius:10px;padding:10px 12px;background:#fff;color:var(--text);font:inherit;font-size:16px}
+    select:focus,input:focus{outline:3px solid rgba(37,99,235,.2);border-color:var(--blue)}
+    button,.file-button{display:flex;align-items:center;justify-content:center;gap:8px;width:100%;min-height:52px;border:0;border-radius:12px;padding:12px 14px;font:inherit;font-weight:750;text-align:center;cursor:pointer;background:#374151;color:#fff;text-decoration:none}
+    button:disabled,.file-button.disabled{opacity:.5;cursor:not-allowed}
+    .primary{background:var(--blue)}
+    .primary:not(:disabled):active{background:var(--blue-dark)}
+    .danger{background:var(--red)}
+    .ghost{background:#e5e7eb;color:#111827}
+    .upload-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}
+    .file-control input{position:absolute;inline-size:1px;block-size:1px;opacity:0;pointer-events:none}
+    .status-line{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:10px;color:var(--muted);font-size:14px;line-height:1.4}
+    .status-pill{display:inline-flex;align-items:center;border-radius:999px;padding:3px 9px;background:#f3f4f6;color:#374151;font-size:12px;font-weight:750;text-transform:uppercase;letter-spacing:.02em}
+    .status-pill.uploading{background:#dbeafe;color:#1e40af}
+    .status-pill.complete{background:#dcfce7;color:#166534}
+    .status-pill.error{background:#fee2e2;color:#991b1b}
+    .progress{height:12px;background:#e5e7eb;border-radius:999px;overflow:hidden;margin-top:10px}
+    .bar{height:100%;width:0%;background:var(--blue);transition:width .18s ease}
+    .summary{font-size:14px;line-height:1.6;color:#1f2937}
+    .counts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+    .count{border:1px solid var(--border);border-radius:12px;padding:12px;background:#fff}
+    .count span{display:block;font-size:12px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.02em}
+    .count strong{display:block;font-size:30px;line-height:1.05;margin-top:3px}
+    .warning{display:none;color:#92400e;background:#fef3c7;border:1px solid #fde68a;border-radius:12px;padding:11px;font-size:14px;line-height:1.35;font-weight:650}
+    .warning.active{display:block}
+    .upload-card{display:none}
+    .upload-card.active{display:block}
+    .upload-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:8px}
+    .next-action{font-size:14px;color:var(--muted);line-height:1.4;margin:8px 0 0}
+    .thumbs{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:12px}
+    .thumb{position:relative;border:1px solid var(--border);border-radius:10px;overflow:hidden;background:#fff;min-width:0}
+    .thumb img{display:block;width:100%;aspect-ratio:1;object-fit:cover;background:#f3f4f6}
+    .thumb button{position:absolute;right:5px;bottom:5px;width:auto;min-height:34px;border-radius:9px;padding:6px 8px;font-size:12px;background:rgba(220,38,38,.95)}
+    .empty{color:var(--muted);font-size:14px;margin:10px 0 0}
+    .submit-panel{position:fixed;left:0;right:0;bottom:0;z-index:10;background:rgba(255,255,255,.96);backdrop-filter:blur(10px);border-top:1px solid var(--border);padding:10px 14px calc(10px + env(safe-area-inset-bottom))}
+    .submit-inner{max-width:680px;margin:0 auto;display:grid;gap:8px}
+    .submit-help{font-size:13px;color:var(--muted);text-align:center;min-height:18px}
+    .success{display:none;border-color:#bbf7d0;background:#f0fdf4}
+    .success.active{display:block}
+    .success strong{display:block;font-size:20px;margin-bottom:8px;color:#166534}
+    .modal{position:fixed;inset:0;z-index:20;display:none;align-items:center;justify-content:center;background:rgba(17,24,39,.86);padding:16px}
+    .modal.active{display:flex}
+    .modal img{max-width:100%;max-height:82vh;border-radius:12px;background:#fff}
+    .modal button{position:absolute;top:14px;right:14px;width:auto;min-height:44px;border-radius:999px;padding:10px 14px;background:#fff;color:#111827}
+    [hidden]{display:none!important}
+    @media (min-width:620px){.fields{grid-template-columns:repeat(2,minmax(0,1fr))}.thumbs{grid-template-columns:repeat(4,minmax(0,1fr))}.app{padding-top:18px}.card{padding:16px}}
+  </style>
+</head>
+<body>
+  <div class="app stack">
+    <header>
+      <div class="top">
+        <div>
+          <h1>Worker Upload</h1>
+          <div class="job-id" id="jobIdText">No job started</div>
+        </div>
+        <a href="/">Admin</a>
+      </div>
+      <div class="steps" aria-label="Upload steps">
+        <div class="step active" id="stepJob">Job</div>
+        <div class="step" id="stepBefore">BEFORE</div>
+        <div class="step" id="stepAfter">AFTER</div>
+        <div class="step" id="stepSubmit">Submit</div>
+      </div>
+    </header>
+
+    <section class="card" id="jobCard">
+      <h2>Job Details</h2>
+      <div class="fields">
+        <label><span>Worker name optional</span><input id="workerName" autocomplete="name" placeholder="Name"></label>
+        <label><span>Month</span><input id="month" value="{{ current_month }}" inputmode="numeric" placeholder="YYYY-MM"></label>
+        <label><span>Site</span>
+          <select id="site">
+            <option value="" selected disabled>Select site</option>
+            {% for site in sites %}<option value="{{ site.name }}">{{ site.name }}</option>{% endfor %}
+          </select>
+        </label>
+        <label><span>Task</span>
+          <select id="task">
+            <option value="" selected disabled>Select task</option>
+            {% for task in tasks %}<option value="{{ task.slug }}">{{ task.name }}</option>{% endfor %}
+          </select>
+        </label>
+      </div>
+      <button class="primary" id="createJob" type="button" style="margin-top:14px">Start Upload Job</button>
+      <p class="next-action" id="setupStatus">Create a job before uploading photos.</p>
+    </section>
+
+    <section class="card" id="overviewCard" hidden>
+      <h2>Current Upload</h2>
+      <div class="summary" id="jobSummary"></div>
+      <div class="counts" style="margin-top:12px">
+        <div class="count"><span>Before</span><strong id="beforeCount">0</strong></div>
+        <div class="count"><span>After</span><strong id="afterCount">0</strong></div>
+      </div>
+      <div class="warning" id="countWarning" style="margin-top:12px">Before and after counts do not match. Supervisor may need to review this.</div>
+    </section>
+
+    <section class="card upload-card" id="beforeCard">
+      <div class="upload-head">
+        <div>
+          <h2>BEFORE Photos</h2>
+          <p class="next-action">Upload all BEFORE photos for this job.</p>
+        </div>
+        <span class="status-pill" id="beforeStatus">waiting</span>
+      </div>
+      <div class="upload-grid">
+        <label class="file-control"><span class="file-button">Choose from Gallery</span><input id="beforeGallery" type="file" accept="image/*" multiple></label>
+        <label class="file-control"><span class="file-button">Take Photo</span><input id="beforeCamera" type="file" accept="image/*" capture="environment"></label>
+      </div>
+      <div class="status-line"><span id="beforeSelected">No files selected</span><span id="beforeProgressText">0%</span></div>
+      <div class="progress"><div class="bar" id="beforeBar"></div></div>
+      <div class="thumbs" id="beforeThumbs"></div>
+    </section>
+
+    <section class="card upload-card" id="afterCard">
+      <div class="upload-head">
+        <div>
+          <h2>AFTER Photos</h2>
+          <p class="next-action">Upload all AFTER photos for this job.</p>
+        </div>
+        <span class="status-pill" id="afterStatus">waiting</span>
+      </div>
+      <div class="upload-grid">
+        <label class="file-control"><span class="file-button">Choose from Gallery</span><input id="afterGallery" type="file" accept="image/*" multiple></label>
+        <label class="file-control"><span class="file-button">Take Photo</span><input id="afterCamera" type="file" accept="image/*" capture="environment"></label>
+      </div>
+      <div class="status-line"><span id="afterSelected">No files selected</span><span id="afterProgressText">0%</span></div>
+      <div class="progress"><div class="bar" id="afterBar"></div></div>
+      <div class="thumbs" id="afterThumbs"></div>
+    </section>
+
+    <section class="card success" id="successCard">
+      <strong>Submitted successfully</strong>
+      <div class="summary" id="successSummary"></div>
+    </section>
+  </div>
+
+  <div class="submit-panel">
+    <div class="submit-inner">
+      <button class="primary" id="submitJob" type="button" disabled>Submit to Supervisor</button>
+      <div class="submit-help" id="submitHelp">Start an upload job first.</div>
+    </div>
+  </div>
+
+  <div class="modal" id="previewModal" aria-hidden="true">
+    <button type="button" id="closePreview">Close</button>
+    <img id="previewImage" alt="Uploaded photo preview">
+  </div>
+
+<script>
+const createJob = document.getElementById('createJob');
+const setupStatus = document.getElementById('setupStatus');
+const jobIdText = document.getElementById('jobIdText');
+const jobCard = document.getElementById('jobCard');
+const overviewCard = document.getElementById('overviewCard');
+const jobSummary = document.getElementById('jobSummary');
+const beforeCount = document.getElementById('beforeCount');
+const afterCount = document.getElementById('afterCount');
+const countWarning = document.getElementById('countWarning');
+const beforeCard = document.getElementById('beforeCard');
+const afterCard = document.getElementById('afterCard');
+const beforeThumbs = document.getElementById('beforeThumbs');
+const afterThumbs = document.getElementById('afterThumbs');
+const submitJob = document.getElementById('submitJob');
+const submitHelp = document.getElementById('submitHelp');
+const successCard = document.getElementById('successCard');
+const successSummary = document.getElementById('successSummary');
+const previewModal = document.getElementById('previewModal');
+const previewImage = document.getElementById('previewImage');
+const closePreview = document.getElementById('closePreview');
+const stepEls = {
+  job: document.getElementById('stepJob'),
+  before: document.getElementById('stepBefore'),
+  after: document.getElementById('stepAfter'),
+  submit: document.getElementById('stepSubmit'),
+};
+const uploadUi = {
+  before: {
+    status: document.getElementById('beforeStatus'),
+    selected: document.getElementById('beforeSelected'),
+    progressText: document.getElementById('beforeProgressText'),
+    bar: document.getElementById('beforeBar'),
+    inputs: [document.getElementById('beforeGallery'), document.getElementById('beforeCamera')],
+  },
+  after: {
+    status: document.getElementById('afterStatus'),
+    selected: document.getElementById('afterSelected'),
+    progressText: document.getElementById('afterProgressText'),
+    bar: document.getElementById('afterBar'),
+    inputs: [document.getElementById('afterGallery'), document.getElementById('afterCamera')],
+  },
+};
+let currentUpload = null;
+let uploading = false;
+
+function escapeHtml(value){
+  return String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+}
+
+function shortId(id){
+  return String(id || '').slice(0, 8).toUpperCase();
+}
+
+function setStep(active){
+  const before = Number(currentUpload?.before_count || 0);
+  const after = Number(currentUpload?.after_count || 0);
+  Object.values(stepEls).forEach(el => el.className = 'step');
+  if(currentUpload){
+    stepEls.job.classList.add('done');
+    if(before > 0) stepEls.before.classList.add('done');
+    if(after > 0) stepEls.after.classList.add('done');
+    if(currentUpload.status === 'ready') stepEls.submit.classList.add('done');
+  }
+  stepEls[active].classList.add('active');
+}
+
+function currentStep(){
+  if(!currentUpload) return 'job';
+  if(currentUpload.status === 'ready') return 'submit';
+  if(Number(currentUpload.before_count || 0) === 0) return 'before';
+  if(Number(currentUpload.after_count || 0) === 0) return 'after';
+  return 'submit';
+}
+
+function setUploadState(when, state, text='', pct=0){
+  const ui = uploadUi[when];
+  ui.status.textContent = state;
+  ui.status.className = `status-pill ${state}`;
+  ui.selected.textContent = text || (state === 'waiting' ? 'No files selected' : ui.selected.textContent);
+  ui.progressText.textContent = `${pct}%`;
+  ui.bar.style.width = `${pct}%`;
+}
+
+function setUploading(value){
+  uploading = value;
+  submitJob.disabled = true;
+  Object.values(uploadUi).forEach(ui => ui.inputs.forEach(input => input.disabled = value || currentUpload?.status === 'ready'));
+  updateSubmitState();
+}
+
+function updateSubmitState(){
+  if(!currentUpload){
+    submitJob.disabled = true;
+    submitHelp.textContent = 'Start an upload job first.';
+    return;
+  }
+  const before = Number(currentUpload.before_count || 0);
+  const after = Number(currentUpload.after_count || 0);
+  if(currentUpload.status === 'ready'){
+    submitJob.disabled = true;
+    submitHelp.textContent = 'Submitted to supervisor.';
+    return;
+  }
+  if(uploading){
+    submitJob.disabled = true;
+    submitHelp.textContent = 'Upload in progress.';
+    return;
+  }
+  if(before === 0 || after === 0){
+    submitJob.disabled = true;
+    submitHelp.textContent = 'Upload at least one BEFORE and one AFTER photo.';
+    return;
+  }
+  submitJob.disabled = false;
+  submitHelp.textContent = before === after ? 'Ready to submit.' : 'Counts do not match. Confirmation required.';
+}
+
+function renderThumbs(upload){
+  const groups = {before: [], after: []};
+  for(const file of upload.files || []){
+    if(groups[file.when]) groups[file.when].push(file);
+  }
+  for(const when of ['before', 'after']){
+    const target = when === 'before' ? beforeThumbs : afterThumbs;
+    target.innerHTML = groups[when].map(file => `
+      <article class="thumb">
+        <img src="/worker-upload/file/${encodeURIComponent(upload.id)}/${encodeURIComponent(file.id)}?variant=thumb" alt="${escapeHtml(file.when)} ${escapeHtml(file.filename)}" data-preview-src="/worker-upload/file/${encodeURIComponent(upload.id)}/${encodeURIComponent(file.id)}?variant=preview">
+        ${upload.status === 'ready' ? '' : `<button class="danger" type="button" data-delete-file="${escapeHtml(file.id)}" data-when="${when}">Delete</button>`}
+      </article>
+    `).join('') || '<p class="empty">No photos yet.</p>';
+  }
+}
+
+function renderUpload(upload){
+  currentUpload = upload;
+  const before = Number(upload.before_count || 0);
+  const after = Number(upload.after_count || 0);
+  jobIdText.textContent = `Job ID ${shortId(upload.id)}`;
+  overviewCard.hidden = false;
+  beforeCard.classList.add('active');
+  afterCard.classList.add('active');
+  beforeCount.textContent = before;
+  afterCount.textContent = after;
+  countWarning.classList.toggle('active', before > 0 && after > 0 && before !== after);
+  jobSummary.innerHTML = `
+    Site: <strong>${escapeHtml(upload.site)}</strong><br>
+    Task: <strong>${escapeHtml(upload.task)}</strong><br>
+    Month: <strong>${escapeHtml(upload.month)}</strong><br>
+    Worker: ${escapeHtml(upload.worker_name || '-')}
+  `;
+  renderThumbs(upload);
+  setStep(currentStep());
+  Object.values(uploadUi).forEach(ui => ui.inputs.forEach(input => input.disabled = upload.status === 'ready'));
+  updateSubmitState();
+}
+
+async function refreshCurrentUpload(){
+  if(!currentUpload) return;
+  const r = await fetch(`/api/worker/uploads/${encodeURIComponent(currentUpload.id)}`);
+  const d = await r.json();
+  if(d.ok) renderUpload(d.upload);
+}
+
+function uploadFiles(when, input){
+  if(!currentUpload || !input.files.length || uploading) return;
+  const files = Array.from(input.files);
+  setUploadState(when, 'waiting', `${files.length} file(s) selected`, 0);
+  const body = new FormData();
+  body.set('when', when);
+  for(const file of files) body.append('photos', file);
+  const xhr = new XMLHttpRequest();
+  setUploading(true);
+  setUploadState(when, 'uploading', `Uploading ${files.length} photo(s)...`, 0);
+  xhr.upload.onprogress = event => {
+    if(!event.lengthComputable) return;
+    const pct = Math.max(1, Math.min(99, Math.round((event.loaded / event.total) * 100)));
+    setUploadState(when, 'uploading', `Uploading ${files.length} photo(s)...`, pct);
+  };
+  xhr.onload = () => {
+    setUploading(false);
+    input.value = '';
+    try{
+      const d = JSON.parse(xhr.responseText || '{}');
+      if(xhr.status < 200 || xhr.status >= 300 || !d.ok){
+        setUploadState(when, 'error', d.error || 'Upload failed.', 0);
+        return;
+      }
+      setUploadState(when, 'complete', `Uploaded ${d.files.length} photo(s).`, 100);
+      renderUpload(d.upload);
+    }catch(e){
+      setUploadState(when, 'error', 'Upload failed.', 0);
+    }
+  };
+  xhr.onerror = () => {
+    setUploading(false);
+    setUploadState(when, 'error', 'Upload failed.', 0);
+  };
+  xhr.open('POST', `/api/worker/uploads/${encodeURIComponent(currentUpload.id)}/files`);
+  xhr.send(body);
+}
+
+createJob.addEventListener('click', async ()=>{
+  setupStatus.textContent = 'Creating upload job...';
+  const body = new URLSearchParams({
+    worker_name: document.getElementById('workerName').value,
+    month: document.getElementById('month').value,
+    site: document.getElementById('site').value,
+    task: document.getElementById('task').value,
+  });
+  try{
+    const r = await fetch('/api/worker/uploads', {method:'POST', body});
+    const d = await r.json();
+    if(!d.ok){
+      setupStatus.textContent = d.error || 'Could not create upload job.';
+      return;
+    }
+    setupStatus.textContent = 'Upload job created. Add BEFORE photos next.';
+    jobCard.hidden = true;
+    renderUpload(d.upload);
+    beforeCard.scrollIntoView({behavior:'smooth', block:'start'});
+  }catch(e){
+    setupStatus.textContent = 'Could not create upload job.';
+  }
+});
+
+for(const [when, ui] of Object.entries(uploadUi)){
+  ui.inputs.forEach(input => input.addEventListener('change', ()=>{
+    if(input.files.length){
+      ui.selected.textContent = `${input.files.length} file(s) selected`;
+      uploadFiles(when, input);
+    }
+  }));
+}
+
+submitJob.addEventListener('click', async ()=>{
+  if(!currentUpload || uploading) return;
+  const before = Number(currentUpload.before_count || 0);
+  const after = Number(currentUpload.after_count || 0);
+  if(before === 0 || after === 0) return;
+  if(before !== after && !confirm('Before and after counts do not match. Submit to supervisor anyway?')) return;
+  submitJob.disabled = true;
+  submitHelp.textContent = 'Submitting...';
+  const r = await fetch(`/api/worker/uploads/${encodeURIComponent(currentUpload.id)}/ready`, {method:'POST'});
+  const d = await r.json();
+  if(!d.ok){
+    submitHelp.textContent = d.error || 'Could not submit.';
+    updateSubmitState();
+    return;
+  }
+  renderUpload(d.upload);
+  successSummary.innerHTML = `
+    Site: <strong>${escapeHtml(d.upload.site)}</strong><br>
+    Task: <strong>${escapeHtml(d.upload.task)}</strong><br>
+    Month: <strong>${escapeHtml(d.upload.month)}</strong><br>
+    Before count: <strong>${escapeHtml(d.upload.before_count)}</strong><br>
+    After count: <strong>${escapeHtml(d.upload.after_count)}</strong>
+  `;
+  successCard.classList.add('active');
+  successCard.scrollIntoView({behavior:'smooth', block:'start'});
+});
+
+function handleThumbClick(event){
+  const deleteButton = event.target.closest('[data-delete-file]');
+  if(deleteButton && currentUpload){
+    event.stopPropagation();
+    if(!confirm('Delete this uploaded photo?')) return;
+    fetch(`/api/worker/uploads/${encodeURIComponent(currentUpload.id)}/files/${encodeURIComponent(deleteButton.dataset.deleteFile)}`, {method:'DELETE'})
+      .then(r => r.json())
+      .then(d => {
+        if(!d.ok){
+          setUploadState(deleteButton.dataset.when, 'error', d.error || 'Could not delete photo.', 0);
+          return;
+        }
+        setUploadState(deleteButton.dataset.when, 'complete', 'Photo deleted.', 100);
+        renderUpload(d.upload);
+      })
+      .catch(()=>setUploadState(deleteButton.dataset.when, 'error', 'Could not delete photo.', 0));
+    return;
+  }
+  const image = event.target.closest('[data-preview-src]');
+  if(image){
+    previewImage.src = image.dataset.previewSrc;
+    previewModal.classList.add('active');
+    previewModal.setAttribute('aria-hidden', 'false');
+  }
+}
+
+beforeThumbs.addEventListener('click', handleThumbClick);
+afterThumbs.addEventListener('click', handleThumbClick);
+closePreview.addEventListener('click', ()=>{
+  previewModal.classList.remove('active');
+  previewModal.setAttribute('aria-hidden', 'true');
+  previewImage.removeAttribute('src');
+});
+previewModal.addEventListener('click', event => {
+  if(event.target === previewModal) closePreview.click();
+});
+</script>
+</body>
+</html>

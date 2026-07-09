@@ -7,11 +7,11 @@ CREATE TABLE IF NOT EXISTS version (
 """
 
 VERSION_SEED = """
-INSERT OR IGNORE INTO version (id, schema_version) VALUES (1, 4);
+INSERT OR IGNORE INTO version (id, schema_version) VALUES (1, 5);
 """
 
 VERSION_UPDATE = """
-UPDATE version SET schema_version = 4 WHERE id = 1 AND schema_version < 4;
+UPDATE version SET schema_version = 5 WHERE id = 1 AND schema_version < 5;
 """
 
 COMPANIES_TABLE = """
@@ -165,6 +165,28 @@ CREATE TABLE IF NOT EXISTS download_history (
 );
 """
 
+WORKER_UPLOAD_JOBS_TABLE = """
+CREATE TABLE IF NOT EXISTS worker_upload_jobs (
+    id TEXT PRIMARY KEY,
+    site TEXT NOT NULL,
+    task TEXT NOT NULL,
+    month TEXT NOT NULL,
+    worker_name TEXT,
+    status TEXT NOT NULL DEFAULT 'draft',
+    before_count INTEGER NOT NULL DEFAULT 0,
+    after_count INTEGER NOT NULL DEFAULT 0,
+    files TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    ready_at TEXT
+);
+"""
+
+WORKER_UPLOAD_JOBS_STATUS_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_worker_upload_jobs_status_created
+ON worker_upload_jobs(status, created_at);
+"""
+
 DOWNLOAD_QUEUE_UPDATED_AT_TRIGGER = """
 CREATE TRIGGER IF NOT EXISTS download_queue_updated_at
 AFTER UPDATE ON download_queue
@@ -200,5 +222,7 @@ SCHEMA = (
     DOWNLOAD_QUEUE_FILE_UNIQUE_INDEX,
     DOWNLOAD_QUEUE_STATUS_INDEX,
     DOWNLOAD_HISTORY_TABLE,
+    WORKER_UPLOAD_JOBS_TABLE,
+    WORKER_UPLOAD_JOBS_STATUS_INDEX,
     DOWNLOAD_QUEUE_UPDATED_AT_TRIGGER,
 )

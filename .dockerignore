@@ -1,0 +1,27 @@
+.git
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+Thumbs.db
+review.diff
+.env
+.env.*
+.venv/
+venv/
+.vscode/
+.idea/
+node_modules/
+data/
+debug.json
+*.debug.json
+torch-cache/
+wget-log
+build/
+dist/
+*.egg-info/
+.worker_upload_cache/
+~tmp_*.jpg
+Dockerfile copy

@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Admin Login</title>
+  <style>
+    :root{color-scheme:light;--bg:#f9fafb;--panel:#fff;--text:#111827;--muted:#4b5563;--border:#e5e7eb;--blue:#2563eb;--blue-dark:#1d4ed8;--red:#b42318}
+    *{box-sizing:border-box}
+    body{margin:0;min-height:100vh;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;display:grid;place-items:center;padding:24px}
+    main{width:100%;max-width:380px;background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:24px;box-shadow:0 1px 2px rgba(0,0,0,.05)}
+    h1{font-size:24px;line-height:1.2;margin:0 0 20px;font-weight:600}
+    label{display:block;margin-bottom:14px}
+    label span{display:block;font-size:14px;margin-bottom:4px;color:#1f2937}
+    input[type="text"],input[type="password"]{width:100%;border:1px solid #d1d5db;border-radius:8px;padding:9px;background:#fff;color:var(--text);font:inherit}
+    input:focus{outline:2px solid rgba(37,99,235,.25);border-color:var(--blue)}
+    .check{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:14px}
+    .check input{width:auto;margin:0}
+    button{width:100%;border:0;border-radius:10px;padding:10px 14px;background:var(--blue);color:#fff;font:inherit;cursor:pointer;margin-top:6px}
+    button:hover{background:var(--blue-dark)}
+    .error{border:1px solid #fecdca;background:#fef3f2;color:var(--red);border-radius:8px;padding:10px 12px;margin:0 0 14px;font-size:14px}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Admin Login</h1>
+    {% if error %}<div class="error" role="alert">{{ error }}</div>{% endif %}
+    <form method="post" action="{{ url_for('login') }}">
+      <input type="hidden" name="next" value="{{ next_url }}">
+      <label><span>Username</span><input name="username" type="text" autocomplete="username" autofocus required></label>
+      <label><span>Password</span><input name="password" type="password" autocomplete="current-password" required></label>
+      <label class="check"><input name="remember" type="checkbox" value="1"> Remember me</label>
+      <button type="submit">Log in</button>
+    </form>
+  </main>
+</body>
+</html>

@@ -24,4 +24,7 @@ COPY . /app
 # avoid "permission denied"
 RUN if [ -f /app/run_all.sh ]; then chmod +x /app/run_all.sh; fi
 
-CMD ["bash","-lc","if [ -f /app/run_all.sh ]; then exec /app/run_all.sh; else exec python3 /app/app.py; fi"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+  CMD curl -fsS "http://127.0.0.1:${PORT:-8080}/health" || exit 1
+
+CMD ["bash","-lc","if [ -f /app/run_all.sh ]; then exec /app/run_all.sh; else exec python3 /app/web.py; fi"]

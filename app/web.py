@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-import csv, json, os, re, subprocess, threading, uuid
-from datetime import datetime
+import csv, json, os, re, secrets, subprocess, threading, time, uuid
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
+from functools import wraps
 from pathlib import Path
 from typing import List, Dict
 from urllib import parse, request as urlrequest
-from flask import Flask, render_template, request, Response, jsonify, send_file
+from flask import Flask, render_template, request, Response, jsonify, send_file, make_response, redirect, session, url_for
 
 from PIL import Image
 import cv2
@@ -24,12 +26,15 @@ except ImportError:
 try:
     import importlib.util
 
+    from core.logger import logger
+    from database.db import connection
     from jobs.manager import JobManager
     from projects.manager import ProjectManager
     from storage.storage import Storage
     from vision.analyze import analyze_folder
     from vision.cache import VisionCache
     from vision.matcher import match_pairs
+    from worker_uploads.manager import WorkerUploadManager
 
     queue_manager_path = Path(__file__).resolve().parent / "queue" / "manager.py"
     spec = importlib.util.spec_from_file_location("local_queue_manager", queue_manager_path)
@@ -37,6 +42,8 @@ try:
     spec.loader.exec_module(queue_manager_module)
     QueueManager = queue_manager_module.QueueManager
 except ImportError:
+    from app.core.logger import logger
+    from app.database.db import connection
     from app.jobs.manager import JobManager
     from app.projects.manager import ProjectManager
     from app.queue.manager import QueueManager
@@ -44,6 +51,7 @@ except ImportError:
     from app.vision.analyze import analyze_folder
     from app.vision.cache import VisionCache
     from app.vision.matcher import match_pairs
+    from app.worker_uploads.manager import WorkerUploadManager
 
 storage = Storage()
 project_manager = ProjectManager()
@@ -149,6 +157,81 @@ def ai_recovery_threshold():
         return float(os.getenv("AI_RECOVERY_THRESHOLD", "0.55"))
     except ValueError:
         return 0.55
+
+def ai_recovery_top_candidates():
+    try:
+        return max(1, int(os.getenv("AI_RECOVERY_TOP_CANDIDATES", "30")))
+    except ValueError:
+        return 30
+
+def bool_from_value(value):
+    return str(value or "").lower() in {"1", "true", "yes", "on"}
+
+def timestamp_score(path: Path):
+    digits = re.findall(r"\d+", Path(path).stem)
+    values = []
+    for item in digits:
+        if len(item) >= 13:
+            values.append(int(item[:13]))
+        elif len(item) >= 12:
+            values.append(int(item[:12]))
+        elif len(item) >= 8:
+            values.append(int(item[:8]))
+    return max(values) if values else None
+
+def ai_status_payload(health):
+    if isinstance(health, dict) and isinstance(health.get("ai"), dict):
+        return health["ai"]
+    return health if isinstance(health, dict) else {}
+
+def ai_recovery_backend_status(progress):
+    health = progress.get("ai_service_health")
+    if not health and ai_engine is not None and hasattr(ai_engine, "health"):
+        try:
+            health = ai_engine.health()
+            progress["ai_service_health"] = health
+        except Exception as exc:
+            health = {"ok": False, "error": str(exc)}
+            progress["ai_service_health"] = health
+    ai_status = ai_status_payload(health)
+    service_ok = bool(health.get("ok")) if isinstance(health, dict) else False
+    cuda_available = ai_status.get("cuda_available") if isinstance(ai_status, dict) else None
+    gpu_name = (ai_status.get("gpu_name") or ai_status.get("device")) if isinstance(ai_status, dict) else None
+    fallback_reason = None
+    if not service_ok:
+        backend = "cpu"
+        fallback_reason = (health or {}).get("error") if isinstance(health, dict) else "AI service unavailable"
+        fallback_reason = fallback_reason or "AI service unhealthy; AI Recovery skipped"
+    elif cuda_available is True:
+        backend = "cuda"
+    elif cuda_available is False:
+        backend = "cpu"
+        fallback_reason = "CUDA unavailable; AI Recovery using CPU service backend"
+    else:
+        backend = "cpu"
+        fallback_reason = "CUDA status unknown; AI Recovery using CPU service backend"
+    return {
+        "backend": backend,
+        "service_ok": service_ok,
+        "cuda_available": cuda_available if isinstance(cuda_available, bool) else None,
+        "gpu_name": gpu_name,
+        "fallback_reason": fallback_reason,
+    }
+
+def filtered_recovery_candidates(before_path: Path, remaining_after, top_n: int, deep_recovery: bool):
+    if deep_recovery:
+        return list(remaining_after)
+    before_ts = timestamp_score(before_path)
+    ranked = []
+    for idx, after_path in enumerate(remaining_after):
+        after_ts = timestamp_score(after_path)
+        if before_ts is not None and after_ts is not None:
+            distance = abs(before_ts - after_ts)
+        else:
+            distance = 10**18
+        ranked.append((distance, Path(after_path).name, idx, after_path))
+    ranked.sort()
+    return [item[3] for item in ranked[:top_n]]
 
 def safe_float(value, default=0.0):
     try:
@@ -280,7 +363,7 @@ def run_ai_pair_review(pairs, progress: dict, should_cancel=None):
     progress["ai_summary"] = summarize_ai_results(results)
     return results
 
-def run_ai_recovery(befores, afters, pairs, progress: dict, should_cancel=None):
+def run_ai_recovery(befores, afters, pairs, progress: dict, should_cancel=None, deep_recovery=False):
     threshold = ai_recovery_threshold()
     stats = {
         "enabled": ai_recovery_enabled(),
@@ -289,6 +372,25 @@ def run_ai_recovery(befores, afters, pairs, progress: dict, should_cancel=None):
         "recovered": 0,
         "failed": 0,
         "comparisons": 0,
+        "planned_comparisons": 0,
+        "full_comparisons": 0,
+        "candidate_pairs_after_filtering": 0,
+        "total_fallback_pairs": 0,
+        "top_candidates": ai_recovery_top_candidates(),
+        "deep_recovery": bool(deep_recovery),
+        "backend": "unknown",
+        "gpu_name": None,
+        "cuda_available": None,
+        "fallback_reason": None,
+        "service_ok": None,
+        "state": "disabled",
+        "current_before": None,
+        "current_after": None,
+        "current_pair": None,
+        "eta_seconds": None,
+        "started_at": None,
+        "completed_at": None,
+        "passes": [],
         "results": [],
         "failed_candidates": [],
         "errors": [],
@@ -298,6 +400,8 @@ def run_ai_recovery(befores, afters, pairs, progress: dict, should_cancel=None):
     if not stats["enabled"]:
         return pairs
     if ai_engine is None:
+        stats["state"] = "error"
+        stats["completed_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
         stats["errors"].append("AI engine unavailable")
         stats["failed_candidates"].append({
             "before": None,
@@ -306,6 +410,7 @@ def run_ai_recovery(befores, afters, pairs, progress: dict, should_cancel=None):
             "threshold": threshold,
             "reason": "ai_engine_unavailable",
         })
+        progress["ai_recovery"] = stats
         return pairs
 
     should_cancel = should_cancel or (lambda: False)
@@ -325,82 +430,237 @@ def run_ai_recovery(befores, afters, pairs, progress: dict, should_cancel=None):
         if item.get("before")
     ]
 
-    for before_path in unmatched_before:
-        if should_cancel():
-            raise CancelledJob("Cancelled by user")
-        if not remaining_after:
-            stats["failed_candidates"].append({
-                "before": str(before_path),
-                "best_after": None,
-                "best_confidence": 0.0,
-                "threshold": threshold,
-                "reason": "no_remaining_after_images",
-            })
-            break
+    backend_status = progress.get("ai_recovery_backend_decision") or ai_recovery_backend_status(progress)
+    stats.update(backend_status)
+    if not backend_status.get("service_ok"):
+        stats["state"] = "skipped"
+        stats["completed_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        stats["eta_seconds"] = 0
+        stats["errors"].append(stats.get("fallback_reason") or "AI service unhealthy; AI Recovery skipped")
+        progress["ai_recovery"] = stats
+        return pairs
 
-        stats["attempted"] += 1
-        best_after = None
-        best_result = None
-        best_confidence = -1.0
+    stats["total_fallback_pairs"] = len(unmatched_before)
+    stats["full_comparisons"] = len(unmatched_before) * len(remaining_after)
 
-        for after_path in list(remaining_after):
+    print(
+        "[ai_recovery] fallback_pairs=%s full_pairs=%s backend=%s cuda_available=%s gpu=%s deep=%s top_candidates=%s" % (
+            stats["total_fallback_pairs"],
+            stats["full_comparisons"],
+            stats["backend"],
+            stats["cuda_available"],
+            stats["gpu_name"],
+            stats["deep_recovery"],
+            stats["top_candidates"],
+        ),
+        flush=True,
+    )
+
+    recovery_started = time.monotonic()
+    last_progress_update = 0.0
+    stats["state"] = "running"
+    stats["started_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    progress["ai_recovery"] = stats
+
+    def update_eta():
+        elapsed = max(0.0, time.monotonic() - recovery_started)
+        completed = int(stats.get("comparisons") or 0)
+        total = int(stats.get("planned_comparisons") or 0)
+        remaining = max(0, total - completed)
+        if completed > 0 and elapsed > 0 and remaining > 0:
+            stats["eta_seconds"] = int(round(remaining / (completed / elapsed)))
+        else:
+            stats["eta_seconds"] = 0 if remaining == 0 else None
+
+    def publish_recovery_progress(force=False):
+        nonlocal last_progress_update
+        update_eta()
+        now = time.monotonic()
+        comparisons = int(stats.get("comparisons") or 0)
+        if force or comparisons % 10 == 0 or now - last_progress_update >= 0.5:
+            progress["ai_recovery"] = stats
+            last_progress_update = now
+
+    def failure_record(before_path, best_after, best_confidence, reason):
+        return {
+            "before": str(before_path) if before_path else None,
+            "best_after": str(best_after) if best_after else None,
+            "best_confidence": round(best_confidence, 4) if best_confidence >= 0 else 0.0,
+            "threshold": threshold,
+            "reason": reason,
+        }
+
+    def run_recovery_pass(pass_number, before_list, top_n, pass_deep):
+        candidate_plan = {
+            before_path: filtered_recovery_candidates(before_path, remaining_after, top_n, pass_deep)
+            for before_path in before_list
+        }
+        pass_stats = {
+            "pass": pass_number,
+            "deep_recovery": bool(pass_deep),
+            "top_candidates": top_n,
+            "attempted": 0,
+            "candidate_pairs": sum(len(items) for items in candidate_plan.values()),
+            "comparisons": 0,
+            "recovered": 0,
+            "failed": 0,
+        }
+        stats["passes"].append(pass_stats)
+        stats["candidate_pairs_after_filtering"] += pass_stats["candidate_pairs"]
+        stats["planned_comparisons"] += pass_stats["candidate_pairs"]
+        next_unmatched = []
+        pass_failures = []
+
+        for before_path in before_list:
             if should_cancel():
                 raise CancelledJob("Cancelled by user")
-            stats["comparisons"] += 1
-            try:
-                result = ai_engine.match(str(before_path), str(after_path))
-            except Exception as exc:
-                stats["errors"].append(
-                    {
+            if not remaining_after:
+                pass_stats["failed"] += 1
+                next_unmatched.append(before_path)
+                pass_failures.append(failure_record(before_path, None, 0.0, "no_remaining_after_images"))
+                publish_recovery_progress(force=True)
+                continue
+
+            pass_stats["attempted"] += 1
+            stats["attempted"] += 1
+            best_after = None
+            best_result = None
+            best_confidence = -1.0
+
+            for after_path in list(candidate_plan.get(before_path, [])):
+                if after_path not in remaining_after:
+                    continue
+                if should_cancel():
+                    raise CancelledJob("Cancelled by user")
+                stats["current_before"] = Path(before_path).name
+                stats["current_after"] = Path(after_path).name
+                stats["current_pair"] = {
+                    "before": Path(before_path).name,
+                    "after": Path(after_path).name,
+                }
+                stats["comparisons"] += 1
+                pass_stats["comparisons"] += 1
+                publish_recovery_progress()
+                try:
+                    result = ai_engine.match(str(before_path), str(after_path))
+                except Exception as exc:
+                    stats["errors"].append({
                         "before": str(before_path),
                         "after": str(after_path),
                         "error": str(exc),
-                    }
-                )
-                continue
+                    })
+                    publish_recovery_progress()
+                    continue
 
-            if result.get("error"):
-                stats["errors"].append(
-                    {
+                if result.get("error"):
+                    stats["errors"].append({
                         "before": str(before_path),
                         "after": str(after_path),
                         "error": result.get("error"),
-                    }
-                )
-                continue
+                    })
+                    publish_recovery_progress()
+                    continue
 
-            confidence = safe_float(result.get("confidence"), 0.0)
-            if confidence > best_confidence:
-                best_confidence = confidence
-                best_after = after_path
-                best_result = result
+                confidence = safe_float(result.get("confidence"), 0.0)
+                if confidence > best_confidence:
+                    best_confidence = confidence
+                    best_after = after_path
+                    best_result = result
+                publish_recovery_progress()
 
-        if best_after and best_result and best_confidence >= threshold:
-            recovered = {
-                **best_result,
-                "before": str(before_path),
-                "after": str(best_after),
-                "confidence": best_confidence,
-                "label": "ai_recovered",
-            }
-            stats["recovered"] += 1
-            stats["results"].append(recovered)
-            remaining_after.remove(best_after)
-            pairs.append((before_path, best_after, best_confidence))
-        else:
-            stats["failed"] += 1
-            stats["failed_candidates"].append({
-                "before": str(before_path),
-                "best_after": str(best_after) if best_after else None,
-                "best_confidence": round(best_confidence, 4) if best_confidence >= 0 else 0.0,
-                "threshold": threshold,
-                "reason": "below_threshold" if best_after else "no_valid_ai_candidate",
-            })
+            if best_after and best_result and best_confidence >= threshold:
+                recovered = {
+                    **best_result,
+                    "before": str(before_path),
+                    "after": str(best_after),
+                    "confidence": best_confidence,
+                    "label": "ai_recovered",
+                    "recovery_pass": pass_number,
+                }
+                stats["recovered"] += 1
+                pass_stats["recovered"] += 1
+                stats["results"].append(recovered)
+                remaining_after.remove(best_after)
+                pairs.append((before_path, best_after, best_confidence))
+            else:
+                pass_stats["failed"] += 1
+                next_unmatched.append(before_path)
+                pass_failures.append(failure_record(
+                    before_path,
+                    best_after,
+                    best_confidence,
+                    "below_threshold" if best_after else "no_valid_ai_candidate",
+                ))
+            publish_recovery_progress(force=True)
+
+        print(
+            "[ai_recovery] pass=%s candidate_pairs=%s comparisons=%s recovered=%s failed=%s deep=%s top_candidates=%s" % (
+                pass_number,
+                pass_stats["candidate_pairs"],
+                pass_stats["comparisons"],
+                pass_stats["recovered"],
+                pass_stats["failed"],
+                pass_stats["deep_recovery"],
+                pass_stats["top_candidates"],
+            ),
+            flush=True,
+        )
+        return next_unmatched, pass_failures
+
+    remaining_before, final_failures = run_recovery_pass(
+        1,
+        unmatched_before,
+        stats["top_candidates"],
+        stats["deep_recovery"],
+    )
+
+    pass1 = stats["passes"][0] if stats["passes"] else {}
+    pass1_attempted = int(pass1.get("attempted") or 0)
+    pass1_recovered = int(pass1.get("recovered") or 0)
+    recovery_rate = (pass1_recovered / pass1_attempted) if pass1_attempted else 0.0
+    remaining_fraction = (len(remaining_before) / len(unmatched_before)) if unmatched_before else 0.0
+    should_escalate = (
+        bool(remaining_before)
+        and not stats["deep_recovery"]
+        and (recovery_rate < 0.50 or remaining_fraction > 0.25)
+    )
+
+    if should_escalate:
+        widened_top = max(len(remaining_after), stats["top_candidates"] * 3)
+        print(
+            "[ai_recovery] escalating pass=2 reason=recovery_rate:%0.3f remaining_fraction:%0.3f remaining_before=%s remaining_after=%s" % (
+                recovery_rate,
+                remaining_fraction,
+                len(remaining_before),
+                len(remaining_after),
+            ),
+            flush=True,
+        )
+        remaining_before, final_failures = run_recovery_pass(2, remaining_before, widened_top, True)
+
+    stats["failed"] = len(remaining_before)
+    stats["failed_candidates"] = final_failures
 
     if stats["recovered"]:
         progress["matched"] = int(progress.get("matched", 0)) + stats["recovered"]
         progress["unmatched"] = max(0, int(progress.get("unmatched", 0)) - stats["recovered"])
 
+    stats["state"] = "done" if stats["state"] == "running" else stats["state"]
+    stats["current_before"] = None
+    stats["current_after"] = None
+    stats["current_pair"] = None
+    stats["eta_seconds"] = 0
+    stats["completed_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    print(
+        "[ai_recovery] final recovered=%s failed=%s comparisons=%s candidate_pairs=%s" % (
+            stats["recovered"],
+            stats["failed"],
+            stats["comparisons"],
+            stats["candidate_pairs_after_filtering"],
+        ),
+        flush=True,
+    )
+    publish_recovery_progress(force=True)
     return pairs
 
 def notify_telegram(message: str) -> None:
@@ -462,6 +722,69 @@ def detect_gpu_status() -> Dict:
         errors.append(f"OpenCV CUDA unavailable: {exc}")
 
     status["error"] = "; ".join(errors) if errors else None
+    return status
+
+
+def _nested_ai_status(health):
+    if isinstance(health, dict) and isinstance(health.get("ai"), dict):
+        return health["ai"]
+    return health if isinstance(health, dict) else {}
+
+def detect_ai_status() -> Dict:
+    checked_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    status = {
+        "service": "unknown",
+        "service_online": None,
+        "backend": "unknown",
+        "cuda_available": None,
+        "gpu_name": None,
+        "ai_review_available": None,
+        "ai_recovery_enabled": ai_recovery_enabled(),
+        "checked_at": checked_at,
+        "error": None,
+        "health": None,
+    }
+
+    if ai_engine is None or not hasattr(ai_engine, "health"):
+        status.update(
+            service="offline",
+            service_online=False,
+            ai_review_available=False,
+            error="AI service health check unavailable",
+        )
+        return status
+
+    try:
+        health = ai_engine.health()
+    except Exception as exc:
+        status.update(
+            service="offline",
+            service_online=False,
+            ai_review_available=False,
+            error=f"AI service health check failed: {exc}",
+        )
+        return status
+
+    status["health"] = health
+    if not isinstance(health, dict):
+        status["error"] = "Invalid AI service health response"
+        return status
+
+    online = bool(health.get("ok"))
+    ai_status = _nested_ai_status(health)
+    cuda_available = ai_status.get("cuda_available")
+    pair_match_implemented = ai_status.get("pair_match_implemented")
+    backend = "cuda" if cuda_available is True else ("cpu" if cuda_available is False else "unknown")
+
+    status.update(
+        service="online" if online else "offline",
+        service_online=online,
+        backend=backend,
+        cuda_available=cuda_available if isinstance(cuda_available, bool) else None,
+        gpu_name=ai_status.get("gpu_name") or ai_status.get("device"),
+        ai_review_available=(online and pair_match_implemented) if isinstance(pair_match_implemented, bool) else None,
+        error=health.get("error") or ai_status.get("model_error"),
+    )
     return status
 
 def crop_to_4x3(im: Image.Image) -> Image.Image:
@@ -533,7 +856,9 @@ def write_debug_report(out_path: Path, progress: dict):
     return debug_path
 
 def build_report(input_root: Path, out_path: Path, company: str, zone: str, title: str,
-                 threshold: float, progress: dict, should_cancel=None, backend="cpu", ai_review=False):
+                 threshold: float, progress: dict, should_cancel=None, backend="cpu", ai_review=False, ai_deep_recovery=False):
+    requested_backend = str(backend or "cpu").strip().lower() or "cpu"
+    main_backend = "cpu" if requested_backend == "auto" else requested_backend
     should_cancel = should_cancel or (lambda: False)
     if should_cancel():
         raise CancelledJob("Cancelled by user")
@@ -555,14 +880,36 @@ def build_report(input_root: Path, out_path: Path, company: str, zone: str, titl
         progress=progress,
         should_cancel=should_cancel,
         cancelled_exception=CancelledJob,
-        backend=backend,
+        backend=main_backend,
     )
+    progress["backend_requested"] = requested_backend
+    progress["main_backend_selected"] = progress.get("backend_used", main_backend)
+    if requested_backend == "auto":
+        progress["backend_note"] = "Auto selected CPU for main matcher"
 
     progress["ai_enabled"] = bool(ai_review)
     progress["ai_results"] = []
     progress["ai_error"] = None
     if ai_review or ai_recovery_enabled():
         check_ai_service(progress)
+    ai_backend_status = ai_recovery_backend_status(progress) if ai_recovery_enabled() else {
+        "backend": "disabled",
+        "cuda_available": None,
+        "gpu_name": None,
+        "fallback_reason": "AI Recovery disabled",
+    }
+    progress["ai_recovery_backend_decision"] = ai_backend_status
+    print(
+        "[backend_auto] requested_backend=%s selected_main_backend=%s selected_ai_backend=%s cuda_available=%s gpu=%s fallback_reason=%s" % (
+            requested_backend,
+            progress.get("main_backend_selected", main_backend),
+            ai_backend_status.get("backend"),
+            ai_backend_status.get("cuda_available"),
+            ai_backend_status.get("gpu_name"),
+            ai_backend_status.get("fallback_reason"),
+        ),
+        flush=True,
+    )
     if ai_review:
         run_ai_pair_review(pairs, progress, should_cancel)
         try:
@@ -572,7 +919,7 @@ def build_report(input_root: Path, out_path: Path, company: str, zone: str, titl
     else:
         progress["ai_state"] = "disabled"
 
-    pairs = run_ai_recovery(befores, afters, pairs, progress, should_cancel)
+    pairs = run_ai_recovery(befores, afters, pairs, progress, should_cancel, ai_deep_recovery)
 
     doc = Document()
     for section in doc.sections:
@@ -660,9 +1007,87 @@ def build_report(input_root: Path, out_path: Path, company: str, zone: str, titl
     progress.update(state="done", download=str(out_path), debug_download=str(debug_path))
 
 app = Flask(__name__)
+app.secret_key = os.getenv("FLASK_SECRET_KEY") or os.getenv("SECRET_KEY") or secrets.token_hex(32)
+app.permanent_session_lifetime = timedelta(days=30)
+
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME") or os.getenv("ADMIN_USER")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD") or os.getenv("ADMIN_PASS")
+INTERNAL_API_TOKEN = os.getenv("INTERNAL_API_TOKEN")
+
+def admin_auth_enabled():
+    return bool(ADMIN_USERNAME and ADMIN_PASSWORD)
+
+def is_admin_logged_in():
+    return bool(session.get("admin_authenticated"))
+
+def valid_internal_api_token():
+    if not INTERNAL_API_TOKEN:
+        return False
+    token = request.headers.get("X-Internal-Api-Token", "")
+    return bool(token) and secrets.compare_digest(token, INTERNAL_API_TOKEN)
+
+def safe_next_url(value):
+    if not value:
+        return url_for("index")
+    parsed = parse.urlparse(value)
+    if parsed.scheme or parsed.netloc or not value.startswith("/"):
+        return url_for("index")
+    return value
+
+def admin_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not admin_auth_enabled() or is_admin_logged_in() or valid_internal_api_token():
+            return view(*args, **kwargs)
+        return redirect(url_for("login", next=request.full_path.rstrip("?")))
+    return wrapped
+
+def no_cache_html(response):
+    response = make_response(response)
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
 
 job_manager = JobManager()
-queue_manager = QueueManager()
+
+def recover_interrupted_report_jobs():
+    interrupted_statuses = ("running", "queued", "processing")
+    message = "Interrupted by server restart"
+    with connection() as conn:
+        cursor = conn.execute(
+            "UPDATE jobs SET status = ?, error = ?, finished_at = CURRENT_TIMESTAMP WHERE status IN (?, ?, ?)",
+            ("error", message, *interrupted_statuses),
+        )
+        recovered = cursor.rowcount if cursor.rowcount is not None else 0
+        conn.commit()
+    logger.info("Recovered %s interrupted report job(s) at startup", recovered)
+    return recovered
+
+recover_interrupted_report_jobs()
+
+
+def max_concurrent_report_jobs():
+    try:
+        return max(1, int(os.getenv("MAX_CONCURRENT_REPORT_JOBS", "1")))
+    except ValueError:
+        return 1
+
+
+class BoundedReportQueue:
+    def __init__(self, max_workers: int):
+        self.max_workers = max(1, int(max_workers or 1))
+        self._executor = ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="report-job")
+        logger.info("Report job queue initialized with max_workers=%s", self.max_workers)
+
+    def submit(self, target, *args, **kwargs):
+        future = self._executor.submit(target, *args, **kwargs)
+        logger.info("Report job queued for bounded execution")
+        return future
+
+
+queue_manager = BoundedReportQueue(max_concurrent_report_jobs())
+worker_upload_manager = WorkerUploadManager(storage)
 REQUIRED_JOB_PAYLOAD_FIELDS = ("month", "site", "task", "company", "zone", "title", "threshold")
 RETRYABLE_STATUSES = {"error", "failed", "cancelled"}
 RERUN_STATUSES = {"done"}
@@ -670,6 +1095,9 @@ RERUN_STATUSES = {"done"}
 def sse_stream(job_id):
     q = job_manager.get_events(job_id)
     yield f"event: ping\ndata: keepalive\n\n"
+    state = job_manager.get_state(job_id)
+    if state:
+        yield f"data: {json.dumps(dict(state))}\n\n"
     while True:
         msg = q.get()
         yield f"data: {msg}\n\n"
@@ -689,18 +1117,21 @@ def create_report_job(payload):
     threshold = float(payload["threshold"])
     backend = str(payload.get("backend", "cpu")).strip().lower() or "cpu"
     ai_review = str(payload.get("ai_review", "")).lower() in {"1", "true", "yes", "on"}
+    ai_deep_recovery = bool_from_value(payload.get("ai_deep_recovery"))
     job_id = uuid.uuid4().hex
     job_payload = dict(payload)
     job_payload["threshold"] = threshold
     job_payload["backend"] = backend
     job_payload["ai_review"] = ai_review
+    job_payload["ai_deep_recovery"] = ai_deep_recovery
     job_manager.create(
         job_id,
         name=f"{month} {site} {task}",
         payload=job_payload,
         state={"state":"queued","done":0,"total":0,"matched":0,"unmatched":0,"before":0,"after":0,"pages":0,"ai_enabled":ai_review,"ai_results":[],"ai_error":None,"ai_state":"disabled"},
     )
-    queue_manager.submit(run_job, job_id, month, site, task, company, zone, title, threshold, backend, ai_review)
+    logger.info("Report job %s queued: %s %s %s", job_id, month, site, task)
+    queue_manager.submit(run_queued_report_job, job_id, month, site, task, company, zone, title, threshold, backend, ai_review, ai_deep_recovery)
     return job_id
 
 def clean_saved_payload(job):
@@ -718,50 +1149,241 @@ def validate_report_payload(payload):
         return "Invalid saved job threshold"
     return None
 
-def run_job(job_id, month, site, task, company, zone, title, threshold, backend="cpu", ai_review=False):
+def run_queued_report_job(job_id, month, site, task, company, zone, title, threshold, backend="cpu", ai_review=False, ai_deep_recovery=False):
+    logger.info("Report job %s starting from queue", job_id)
+    try:
+        run_job(job_id, month, site, task, company, zone, title, threshold, backend, ai_review, ai_deep_recovery)
+    finally:
+        job = job_manager.get_state(job_id)
+        status = (job or {}).get("state", "unknown")
+        logger.info("Report job %s finished with status=%s", job_id, status)
+
+
+def run_job(job_id, month, site, task, company, zone, title, threshold, backend="cpu", ai_review=False, ai_deep_recovery=False):
     try:
         job = job_manager.get_state(job_id)
         if job_manager.is_cancelled(job_id):
             raise CancelledJob("Cancelled by user")
         job.update(state="starting", done=0, total=0)
+        logger.info("Report job %s running: %s %s %s", job_id, month, site, task)
         notify_telegram(f"Report job started: {month} {site} {task}")
         push(job_id)
         input_root = DATA_ROOT / month / site / task
         legacy_name = "drainage" if task == "drainage_cleaning" else task
         out_name = f"{month}_{site}_{legacy_name}.docx"
         out_path = REPORT_ROOT / out_name
-        build_report(input_root, out_path, company, zone, title, threshold, job, lambda: job_manager.is_cancelled(job_id), backend, ai_review)
+        build_report(input_root, out_path, company, zone, title, threshold, job, lambda: job_manager.is_cancelled(job_id), backend, ai_review, ai_deep_recovery)
+        logger.info("Report job %s completed: %s", job_id, out_name)
         notify_telegram(f"Report job completed: {out_name}")
         push(job_id)
     except CancelledJob:
         job = job_manager.get_state(job_id)
         if job:
             job.update(state="cancelled", error="Cancelled by user", download=None)
+        logger.info("Report job %s cancelled", job_id)
         push(job_id)
     except Exception as e:
         job = job_manager.get_state(job_id)
         if job:
             job.update(state="error", error=str(e))
+        logger.exception("Report job %s failed", job_id)
         notify_telegram(f"Report job failed: {month} {site} {task}\n{e}")
         push(job_id)
 
 @app.route("/")
+@admin_required
 def index():
     ms = scan_months_sites()
-    return render_template("index.html", months_sites=ms, tasks=report_tasks(), defaults=report_defaults())
+    return no_cache_html(render_template("index.html", months_sites=ms, tasks=report_tasks(), defaults=report_defaults()))
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if not admin_auth_enabled():
+        return redirect(url_for("index"))
+
+    next_url = safe_next_url(request.values.get("next"))
+    error = None
+
+    if request.method == "POST":
+        username = request.form.get("username", "")
+        password = request.form.get("password", "")
+        if secrets.compare_digest(username, ADMIN_USERNAME) and secrets.compare_digest(password, ADMIN_PASSWORD):
+            session.clear()
+            session.permanent = request.form.get("remember") == "1"
+            session["admin_authenticated"] = True
+            return redirect(next_url)
+        error = "Invalid username or password"
+
+    return no_cache_html(render_template("login.html", error=error, next_url=next_url))
+
+@app.get("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login") if admin_auth_enabled() else url_for("index"))
+
+
+def current_month_value():
+    return datetime.now().strftime("%Y-%m")
+
+WORKER_ALLOWED_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp", "heic", "heif"}
+
+def worker_upload_limit(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except ValueError:
+        return default
+
+def worker_upload_file_size(upload) -> int:
+    stream = upload.stream
+    position = stream.tell()
+    stream.seek(0, os.SEEK_END)
+    size = stream.tell()
+    stream.seek(position)
+    return size
+
+def validate_worker_upload_payload(data):
+    site = str(data.get("site", "")).strip()
+    task = str(data.get("task", "")).strip()
+    month = str(data.get("month", "")).strip()
+    worker_name = str(data.get("worker_name", "")).strip()
+    if not re.match(r"^\d{4}-\d{2}$", month):
+        return None, "Month must use YYYY-MM"
+    site_row = project_manager.find_site(site)
+    if not site_row:
+        return None, "Unknown site"
+    task_row = project_manager.task_by_slug(task)
+    if not task_row:
+        return None, "Unknown task"
+    return {"site": site_row["name"], "task": task_row["slug"], "month": month, "worker_name": worker_name}, None
+
+@app.get("/worker-upload")
+def worker_upload():
+    return no_cache_html(render_template(
+        "worker_upload.html",
+        sites=project_manager.list_sites(),
+        tasks=report_tasks(),
+        current_month=current_month_value(),
+    ))
+
+@app.get("/api/worker/uploads")
+def worker_uploads_list():
+    limit = request.args.get("limit", "50")
+    status = request.args.get("status", "").strip().lower()
+    try:
+        jobs = worker_upload_manager.list_jobs(int(limit), status=status)
+    except ValueError:
+        jobs = worker_upload_manager.list_jobs(status=status)
+    return jsonify({"ok": True, "uploads": jobs})
+
+@app.post("/api/worker/uploads")
+def worker_uploads_create():
+    data = request.get_json(silent=True) or request.form.to_dict()
+    payload, error = validate_worker_upload_payload(data)
+    if error:
+        return jsonify({"ok": False, "error": error}), 400
+    try:
+        job = worker_upload_manager.create(**payload)
+        return jsonify({"ok": True, "upload": job})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+@app.get("/api/worker/uploads/<upload_id>")
+def worker_uploads_get(upload_id):
+    job = worker_upload_manager.get(upload_id)
+    if not job:
+        return jsonify({"ok": False, "error": "Upload job not found"}), 404
+    return jsonify({"ok": True, "upload": job})
+
+@app.post("/api/worker/uploads/<upload_id>/files")
+def worker_uploads_add_files(upload_id):
+    when = request.form.get("when", "").strip().lower()
+    uploads = [item for item in request.files.getlist("photos") if item and item.filename]
+    if not uploads:
+        return jsonify({"ok": False, "error": "No photos uploaded"}), 400
+
+    max_files_per_request = worker_upload_limit("WORKER_MAX_FILES_PER_REQUEST", 50)
+    if len(uploads) > max_files_per_request:
+        return jsonify({"ok": False, "error": f"Maximum {max_files_per_request} files per upload request"}), 400
+
+    job = worker_upload_manager.get(upload_id)
+    if not job:
+        return jsonify({"ok": False, "error": "Upload job not found"}), 404
+
+    max_files_per_job = worker_upload_limit("WORKER_MAX_FILES_PER_JOB", 300)
+    current_file_count = len(job.get("files") or [])
+    if current_file_count + len(uploads) > max_files_per_job:
+        return jsonify({"ok": False, "error": f"Maximum {max_files_per_job} files per worker job"}), 400
+
+    max_file_mb = worker_upload_limit("WORKER_MAX_FILE_MB", 20)
+    max_file_bytes = max_file_mb * 1024 * 1024
+    for item in uploads:
+        filename = Path(item.filename or "").name
+        extension = Path(filename).suffix.lower().lstrip(".")
+        if extension not in WORKER_ALLOWED_IMAGE_EXTENSIONS:
+            allowed = ", ".join(sorted(WORKER_ALLOWED_IMAGE_EXTENSIONS))
+            return jsonify({"ok": False, "error": f"Only image uploads are allowed ({allowed})"}), 400
+        if worker_upload_file_size(item) > max_file_bytes:
+            return jsonify({"ok": False, "error": f"{filename} exceeds the {max_file_mb} MB image size limit"}), 400
+
+    added = []
+    try:
+        for item in uploads:
+            added.append(worker_upload_manager.add_file(upload_id, when, item))
+        job = worker_upload_manager.get(upload_id)
+        return jsonify({"ok": True, "files": added, "upload": job})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+@app.delete("/api/worker/uploads/<upload_id>/files/<file_id>")
+def worker_uploads_delete_file(upload_id, file_id):
+    try:
+        removed = worker_upload_manager.delete_file(upload_id, file_id)
+        job = worker_upload_manager.get(upload_id)
+        return jsonify({"ok": True, "removed": removed, "upload": job})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+@app.post("/api/worker/uploads/<upload_id>/ready")
+def worker_uploads_ready(upload_id):
+    try:
+        job = worker_upload_manager.mark_ready(upload_id)
+        return jsonify({"ok": True, "upload": job})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+@app.get("/worker-upload/file/<upload_id>/<file_id>")
+def worker_upload_file(upload_id, file_id):
+    job = worker_upload_manager.get(upload_id)
+    if not job:
+        return "Not found", 404
+    item = next((entry for entry in job.get("files", []) if entry.get("id") == file_id), None)
+    if not item:
+        return "Not found", 404
+    variant = request.args.get("variant", "thumb").strip().lower()
+    path_key = "path" if variant == "preview" else "thumbnail_path"
+    path = Path(item.get(path_key) or item.get("path") or "").resolve()
+    try:
+        path.relative_to(DATA_ROOT.resolve())
+    except ValueError:
+        return "Not found", 404
+    if not path.exists() or not path.is_file():
+        return "Not found", 404
+    return send_file(path)
 
 @app.get("/settings")
+@admin_required
 def settings():
-    return render_template(
+    return no_cache_html(render_template(
         "settings.html",
         companies=project_manager.list_companies(),
         projects=project_manager.list_projects(),
         sites=project_manager.list_sites(),
         categories=project_manager.list_categories(),
         tasks=project_manager.list_tasks(),
-    )
+    ))
 
 @app.get("/api/settings/<entity>")
+@admin_required
 def settings_list(entity):
     try:
         mapping = {
@@ -776,6 +1398,7 @@ def settings_list(entity):
         return jsonify(ok=False, error="Unknown settings entity"), 404
 
 @app.post("/api/settings/<entity>")
+@admin_required
 def settings_create(entity):
     data = request.get_json(silent=True) or request.form.to_dict()
     try:
@@ -784,6 +1407,7 @@ def settings_create(entity):
         return jsonify(ok=False, error=str(exc)), 400
 
 @app.put("/api/settings/<entity>/<item_id>")
+@admin_required
 def settings_update(entity, item_id):
     data = request.get_json(silent=True) or request.form.to_dict()
     try:
@@ -792,6 +1416,7 @@ def settings_update(entity, item_id):
         return jsonify(ok=False, error=str(exc)), 400
 
 @app.delete("/api/settings/<entity>/<item_id>")
+@admin_required
 def settings_delete(entity, item_id):
     try:
         project_manager.delete(entity, item_id)
@@ -800,6 +1425,7 @@ def settings_delete(entity, item_id):
         return jsonify(ok=False, error=str(exc)), 400
 
 @app.post("/start")
+@admin_required
 def start():
     data = request.form
     month = data.get("month","").strip()
@@ -813,9 +1439,10 @@ def start():
     threshold = float(data.get("threshold", defaults["threshold"]))
     backend = data.get("backend", "cpu").strip().lower() or "cpu"
     ai_review = data.get("ai_review") == "1"
+    ai_deep_recovery = data.get("ai_deep_recovery") == "1"
     if not month or not site:
         return jsonify({"ok": False, "error": "Please choose a month and a site"}), 400
-    payload = {"month": month, "site": site, "task": task, "company": company, "zone": zone, "title": title, "threshold": threshold, "backend": backend, "ai_review": ai_review}
+    payload = {"month": month, "site": site, "task": task, "company": company, "zone": zone, "title": title, "threshold": threshold, "backend": backend, "ai_review": ai_review, "ai_deep_recovery": ai_deep_recovery}
     job_id = create_report_job(payload)
     return jsonify({"ok": True, "job_id": job_id})
 
@@ -826,6 +1453,7 @@ def progress(job_id):
     return Response(sse_stream(job_id), mimetype="text/event-stream")
 
 @app.get("/api/jobs")
+@admin_required
 def jobs_list():
     limit = request.args.get("limit", "50")
     status = request.args.get("status", "").strip()
@@ -837,6 +1465,7 @@ def jobs_list():
     return jsonify({"ok": True, "jobs": jobs, "counts": job_manager.job_counts()})
 
 @app.get("/api/jobs/<job_id>")
+@admin_required
 def jobs_get(job_id):
     job = job_manager.get_job(job_id)
     if not job:
@@ -844,6 +1473,7 @@ def jobs_get(job_id):
     return jsonify({"ok": True, "job": job})
 
 @app.post("/api/jobs/<job_id>/retry")
+@admin_required
 def jobs_retry(job_id):
     job = job_manager.get_job(job_id)
     if not job:
@@ -864,6 +1494,7 @@ def jobs_retry(job_id):
     return jsonify({"ok": True, "job_id": new_job_id, "mode": mode})
 
 @app.post("/api/jobs/<job_id>/cancel")
+@admin_required
 def jobs_cancel(job_id):
     job = job_manager.get_job(job_id)
     if not job:
@@ -876,6 +1507,7 @@ def jobs_cancel(job_id):
     return jsonify({"ok": True, "job_id": job_id, "status": "cancelled"})
 
 @app.get("/api/folders/scan")
+@admin_required
 def folders_scan():
     months_sites = scan_months_sites()
     return jsonify(
@@ -893,7 +1525,46 @@ def folders_scan():
 def system_gpu():
     return jsonify({"ok": True, "gpu": detect_gpu_status()})
 
+def health_database_check():
+    with connection() as conn:
+        conn.execute("SELECT 1").fetchone()
+
+
+def health_writable_check(path: Path):
+    probe = path / f".healthcheck-{uuid.uuid4().hex}"
+    path.mkdir(parents=True, exist_ok=True)
+    probe.write_text("ok")
+    probe.unlink(missing_ok=True)
+
+@app.get("/health")
+def health():
+    checks = {}
+
+    def record(name, callback):
+        try:
+            callback()
+            checks[name] = {"ok": True}
+        except Exception as exc:
+            checks[name] = {"ok": False, "error": str(exc)}
+
+    record("app", lambda: True)
+    record("database", health_database_check)
+    record("reports_writable", lambda: health_writable_check(REPORT_ROOT))
+    record("photos_writable", lambda: health_writable_check(DATA_ROOT))
+
+    worker_cache = getattr(worker_upload_manager, "cache_root", None)
+    if worker_cache:
+        record("worker_upload_cache_writable", lambda: health_writable_check(Path(worker_cache)))
+
+    ok = all(item.get("ok") for item in checks.values())
+    return jsonify({"ok": ok, "checks": checks}), 200 if ok else 503
+
+@app.get("/api/system/ai")
+def system_ai():
+    return jsonify({"ok": True, "ai": detect_ai_status()})
+
 @app.post("/api/vision/analyze")
+@admin_required
 def vision_analyze():
     data = request.get_json(silent=True) or request.form.to_dict()
     month = str(data.get("month", "")).strip()
@@ -918,13 +1589,38 @@ def vision_analyze():
     return jsonify({"ok": True, **result})
 
 @app.get("/download")
+@admin_required
 def download():
-    path = request.args.get("path")
-    if not path or not storage.exists(Path(path)):
+    path_value = request.args.get("path", "").strip()
+    if not path_value:
         return "Not found", 404
-    return send_file(path, as_attachment=True)
+
+    requested = Path(path_value)
+    if requested.is_absolute() or ".." in requested.parts:
+        return "Not found", 404
+
+    report_root = REPORT_ROOT.resolve()
+    path = report_root / requested
+
+    try:
+        for parent in path.parents:
+            if parent == report_root.parent:
+                break
+            if parent.exists() and parent.is_symlink():
+                return "Not found", 404
+        if path.exists() and path.is_symlink():
+            return "Not found", 404
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(report_root)
+    except (FileNotFoundError, RuntimeError, ValueError):
+        return "Not found", 404
+
+    if not resolved.is_file():
+        return "Not found", 404
+    return send_file(resolved, as_attachment=True)
 
 @app.get("/download/job/<job_id>")
+@admin_required
 def download_job(job_id):
     job = job_manager.get_job(job_id)
     if not job or not job.get("result_path"):
@@ -939,6 +1635,7 @@ def download_job(job_id):
     return send_file(path, as_attachment=True)
 
 @app.get("/download/debug/<job_id>")
+@admin_required
 def download_debug(job_id):
     job = job_manager.get_job(job_id)
     if not job or not job.get("result_path"):
